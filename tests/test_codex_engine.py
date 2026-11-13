@@ -500,7 +500,7 @@ def test_login_endpoints_and_health(tmp_path: Path, monkeypatch) -> None:
         health = client.get("/health").json()["codex"]
         assert health["credential"] == "chatgpt" and health["plan"] == "plus"
         assert client.get("/auth/codex/login/nope").status_code == 404
-        assert client.delete("/auth/codex/token").json() == {"removed": True}
+        assert client.delete("/auth/codex/token").json() == {"removed": True, "credential": "none"}
         assert client.get("/health").json()["codex"]["credential"] == "none"
 
 

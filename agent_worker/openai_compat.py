@@ -14,6 +14,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from agent_worker import cursor_auth
 from agent_worker.images import parse_image
 from agent_worker.jobs import Job, JobError, JobManager, JobRequest
 from agent_worker.mcp_config import DEPTH_HEADER, parse_depth
@@ -150,7 +151,7 @@ async def models(request: Request) -> dict[str, Any]:
     manager: JobManager = request.app.state.jobs
     rows = await manager.engine.models()
     default = manager.settings.model
-    if default and manager.settings.cursor_api_key and not any(row["id"] == default for row in rows):
+    if default and cursor_auth.api_key(manager.settings) and not any(row["id"] == default for row in rows):
         rows = [{"id": default, "name": default, "engine": "cursor"}, *rows]
     return {
         "object": "list",

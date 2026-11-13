@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
+from agent_worker.cursor_auth import api_key as cursor_api_key
 from agent_worker.events import map_sdk_message
 from agent_worker.images import cursor_payload
 from agent_worker.redact import redact
@@ -24,8 +25,8 @@ from agent_worker.settings import Settings, profile_tools
 logger = logging.getLogger(__name__)
 
 MISSING_KEY = (
-    "CURSOR_API_KEY is not set. Create a user API key at https://cursor.com/dashboard/integrations "
-    "and set it on the worker container."
+    "No Cursor API key is set. Create a user API key at https://cursor.com/dashboard/integrations "
+    "and set CURSOR_API_KEY on the worker container or send it to PUT /auth/cursor/key."
 )
 
 BASE_INSTRUCTIONS = (
@@ -102,8 +103,18 @@ class CursorEngine:
         self._models: tuple[float, list[dict[str, str]]] | None = None
 
     @property
+    def api_key(self) -> str:
+        """CURSOR_API_KEY, else the key set over PUT /auth/cursor/key (read on each use: no restart)."""
+        return cursor_api_key(self.settings)
+
+    @property
     def available(self) -> bool:
-        return bool(self.settings.cursor_api_key)
+        return bool(self.api_key)
+
+    def reset_credentials(self) -> None:
+        """The key changed: open agents and the model list belong to the old one."""
+        self._agents.clear()
+        self._models = None
 
     async def _client(self, workspace: str, path: Path) -> Any:
         async with self._client_lock:
@@ -136,7 +147,7 @@ class CursorEngine:
         tools, blocked = profile_tools(spec.profile)
         resolved = spec.model.strip() or self.settings.model
         kwargs: dict[str, Any] = {
-            "api_key": self.settings.cursor_api_key,
+            "api_key": self.api_key,
             "name": name,
             "local": LocalAgentOptions(cwd=str(spec.path)),
         }
@@ -190,7 +201,7 @@ class CursorEngine:
         self._set_agent_id(workspace, session, "")
 
     async def run(self, spec: RunSpec, emit: Emit) -> Outcome:
-        if not self.settings.cursor_api_key:
+        if not self.api_key:
             raise EngineError(MISSING_KEY)
         started = time.monotonic()
         before = await git_head(spec.path)
@@ -264,11 +275,11 @@ class CursorEngine:
 
     async def models(self) -> list[dict[str, str]]:
         """Models the Cursor account can use, cached for an hour."""
-        if not self.settings.cursor_api_key:
+        if not self.api_key:
             return []
         if self._models and self._models[0] > time.monotonic():
             return self._models[1]
-        key = self.settings.cursor_api_key
+        key = self.api_key
 
         def fetch() -> list[dict[str, str]]:
             from cursor_sdk import Cursor
@@ -284,7 +295,7 @@ class CursorEngine:
         return rows
 
     def _public(self, exc: BaseException) -> str:
-        text = redact(str(exc), [self.settings.cursor_api_key])
+        text = redact(str(exc), [self.api_key])
         if getattr(exc, "is_retryable", None):
             text = f"{text} (retryable)"
         return text

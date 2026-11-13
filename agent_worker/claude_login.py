@@ -40,6 +40,9 @@ LINK_SECONDS = 45
 TOKEN_SECONDS = 60
 # A sign-in that nobody finishes is dropped after this long.
 LOGIN_TTL_SECONDS = 15 * 60
+# Codes that are not even shaped like one; after this many the sign-in is dropped.
+MAX_BAD_CODES = 5
+PENDING = frozenset({"starting", "awaiting_code", "verifying"})
 _MAX_CODE = 512
 
 _ANSI = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]")
@@ -51,7 +54,8 @@ _CODE = re.compile(r"^[A-Za-z0-9_\-#.~]+$")
 
 
 class LoginError(Exception):
-    """`key` is what the agent form shows: cli_missing, no_link, code_rejected, bad_code, timeout, expired."""
+    """`key` is what the agent form shows: cli_missing, no_link, code_rejected, bad_code, too_many_attempts,
+    busy, timeout, expired."""
 
     def __init__(self, key: str, detail: str = "") -> None:
         super().__init__(detail or key)
@@ -114,11 +118,18 @@ def _child_env(home: str) -> dict[str, str]:
 
 
 class ClaudeLogin:
-    """One run of `claude setup-token`."""
+    """One run of `claude setup-token`.
+
+    status: starting -> awaiting_code -> verifying -> succeeded | failed; or cancelled / expired.
+    """
 
     def __init__(self, cli: str) -> None:
         self.id = secrets.token_urlsafe(16)
         self.created = time.monotonic()
+        self.link = ""
+        self.status = "starting"
+        self.error = ""
+        self.bad_codes = 0
         self._cli = cli
         self._home = tempfile.mkdtemp(prefix="claude-login-")
         self._buf = bytearray()
@@ -131,6 +142,22 @@ class ClaudeLogin:
     @property
     def expired(self) -> bool:
         return time.monotonic() - self.created > LOGIN_TTL_SECONDS
+
+    @property
+    def pending(self) -> bool:
+        return self.status in PENDING
+
+    def expires_in(self) -> int:
+        return max(0, int(LOGIN_TTL_SECONDS - (time.monotonic() - self.created)))
+
+    def as_dict(self) -> dict:
+        """What a UI may see: the sign-in link and the state. Never the token or the code."""
+        out: dict = {"id": self.id, "status": self.status, "url": self.link}
+        if self.pending:
+            out["expires_in"] = self.expires_in()
+        if self.error:
+            out["error"] = self.error
+        return out
 
     def _text(self, since: int = 0) -> str:
         with self._lock:
@@ -235,20 +262,62 @@ class ClaudeLogin:
 
 
 class LoginManager:
-    """At most one sign-in at a time; a new one replaces the old one."""
+    """At most one sign-in at a time; a new one replaces the old one.
+
+    The last sign-in stays known after it ended (succeeded, failed, ...) so a UI can still read
+    its outcome with get(); its CLI is stopped by then. A pending one is stopped after
+    LOGIN_TTL_SECONDS even if nobody asks about it again.
+    """
 
     def __init__(self, cli_finder=None) -> None:
         # Looked up on each use, so a CLI that appears later (or a test) is picked up.
         self._cli_finder = cli_finder or (lambda: cli_path())
         self._current: ClaudeLogin | None = None
+        self._timer: asyncio.TimerHandle | None = None
 
     def available(self) -> bool:
         return bool(self._cli_finder())
 
-    def _drop(self) -> None:
-        if self._current is not None:
-            self._current.close()
-            self._current = None
+    def _end(self, login: ClaudeLogin, status: str, error: str = "") -> None:
+        if login.pending:
+            login.status = status
+            if error:
+                login.error = error
+        login.close()
+
+    def _drop(self, status: str = "cancelled") -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        login, self._current = self._current, None
+        if login is not None:
+            self._end(login, status)
+
+    def _expire_if_old(self, login: ClaudeLogin) -> None:
+        if login.pending and login.expired:
+            self._end(login, "expired")
+
+    def _on_timer(self, login_id: str) -> None:
+        self._timer = None
+        login = self._current
+        if login is not None and login.id == login_id and login.pending:
+            logger.info("Claude sign-in expired without a code")
+            self._end(login, "expired")
+
+    def current(self) -> ClaudeLogin | None:
+        """The sign-in that is still waiting for its code, if any."""
+        login = self._current
+        if login is None:
+            return None
+        self._expire_if_old(login)
+        return login if login.pending else None
+
+    def get(self, login_id: str) -> ClaudeLogin:
+        login = self._current
+        if login is None or login.id != str(login_id or ""):
+            raise LoginError("expired")
+        self._expire_if_old(login)
+        return login
 
     async def start(self) -> ClaudeLogin:
         cli = self._cli_finder()
@@ -262,26 +331,54 @@ class LoginManager:
         except BaseException:
             if self._current is login:
                 self._current = None
+            login.status = "failed"
+            login.close()
             raise
+        login.status = "awaiting_code"
+        try:
+            self._timer = asyncio.get_running_loop().call_later(LOGIN_TTL_SECONDS, self._on_timer, login.id)
+        except RuntimeError:
+            self._timer = None
         return login
 
     async def finish(self, login_id: str, code: str) -> str:
         login = self._current
-        if login is None or login.id != str(login_id or "") or login.expired:
-            if login is not None and login.expired:
-                self._drop()
+        if login is None or login.id != str(login_id or ""):
             raise LoginError("expired")
-        # A mistyped code keeps the sign-in open for another try.
-        clean_code(code)
+        self._expire_if_old(login)
+        if login.status == "verifying":
+            raise LoginError("busy")
+        if login.status != "awaiting_code":
+            raise LoginError("expired")
+        # A mistyped code keeps the sign-in open for another try, a few times.
         try:
-            return await login.finish(code)
-        finally:
-            if self._current is login:
-                self._current = None
+            clean_code(code)
+        except LoginError:
+            login.bad_codes += 1
+            if login.bad_codes >= MAX_BAD_CODES:
+                self._end(login, "failed", "too_many_attempts")
+                raise LoginError("too_many_attempts") from None
+            raise
+        login.status = "verifying"
+        try:
+            token = await login.finish(code)
+        except LoginError as exc:
+            self._end(login, "failed", exc.key)
+            raise
+        except BaseException:
+            self._end(login, "failed", "login_failed")
+            raise
+        login.status = "succeeded"
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        return token
 
-    def cancel(self, login_id: str) -> None:
+    def cancel(self, login_id: str) -> bool:
         if self._current is not None and self._current.id == str(login_id or ""):
             self._drop()
+            return True
+        return False
 
     def close(self) -> None:
         self._drop()

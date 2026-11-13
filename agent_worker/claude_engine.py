@@ -45,8 +45,8 @@ MODELS = (
     ("claude-haiku-5-5", "Claude Haiku 5.5"),
 )
 MISSING_KEY = (
-    "No Claude credential is set. Sign in with `docker exec -it agent-worker python -m "
-    "agent_worker.claude_login`, or set CLAUDE_CODE_OAUTH_TOKEN (Claude Plan token from `claude setup-token`) "
+    "No Claude credential is set. Sign in from a UI (POST /auth/claude/login) or with `docker exec -it "
+    "agent-worker python -m agent_worker.claude_login`, or set CLAUDE_CODE_OAUTH_TOKEN (Claude Plan token from `claude setup-token`) "
     f"or ANTHROPIC_API_KEY ({API_KEY_URL}) on the worker."
 )
 NOT_INSTALLED = "claude-agent-sdk is not installed in this worker image."

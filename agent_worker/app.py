@@ -15,6 +15,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 
 from agent_worker import openai_compat
+from agent_worker.auth import KEY_UPDATES, LOGIN_STARTS, RateLimit
 from agent_worker.engine import CursorEngine, Engine
 from agent_worker.images import parse_images
 from agent_worker.jobs import JobError, JobManager, JobRequest, Store
@@ -68,6 +69,12 @@ class LoginCode(BaseModel):
     code: str = Field(default="", max_length=512)
 
 
+class CursorKey(BaseModel):
+    api_key: str = Field(max_length=512)
+    # Ask Cursor whether the key works before storing it.
+    verify: bool = True
+
+
 class JobBody(BaseModel):
     task: str = Field(max_length=320_000)
     engine: str = Field(default="", max_length=20)
@@ -106,7 +113,10 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             settings.default_engine,
         )
     manager = JobManager(settings, engine, store)
-    mcp = build_mcp(manager)
+    login_starts = RateLimit(*LOGIN_STARTS)
+    key_updates = RateLimit(*KEY_UPDATES)
+    # The MCP view never carries sign-in links or codes; `app` is bound below, before any request.
+    mcp = build_mcp(manager, auth_status=lambda: app.state.auth_status(reveal=False))
     # Our own middleware checks the token and the Host header; the MCP app's host check would
     # otherwise refuse every name except 127.0.0.1 when the worker listens on 0.0.0.0.
     mcp_app = mcp.streamable_http_app(
@@ -141,7 +151,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             logger.error("Could not set up GIT_REPO in the default workspace: %s", exc)
         if not engine.available:
             logger.warning(
-                "No engine is set up (CURSOR_API_KEY, a Claude credential or a Codex sign-in). "
+                "No engine is set up (a Cursor API key, a Claude credential or a Codex sign-in). "
                 "Jobs will fail until one is."
             )
         if not settings.token and not settings.open_without_token():
@@ -181,10 +191,9 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
         return await call_next(request)
 
     def _engine_ready(name: str) -> bool:
-        engines = getattr(engine, "engines", None)
-        if engines is None:
-            return engine.available if name == "cursor" else False
-        return name in engines and engines[name].available
+        from agent_worker.auth import engine_ready
+
+        return engine_ready(engine, name)
 
     def _login_manager():
         from agent_worker.claude_login import LoginManager
@@ -200,9 +209,31 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             app.state.codex_login = CodexLoginManager(settings)
         return app.state.codex_login
 
+    def _limit(limiter, key: str) -> None:
+        wait = limiter.hit(key)
+        if wait:
+            raise HTTPException(
+                status_code=429,
+                detail={"error": "rate_limited", "retry_after": wait},
+                headers={"Retry-After": str(wait)},
+            )
+
+    def _auth_status(reveal: bool = True) -> dict[str, Any]:
+        from agent_worker.auth import auth_status
+
+        return auth_status(
+            settings,
+            engine,
+            getattr(app.state, "claude_login", None),
+            getattr(app.state, "codex_login", None),
+            reveal=reveal,
+        )
+
+    app.state.auth_status = _auth_status
+
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        from agent_worker import codex_login
+        from agent_worker import codex_login, cursor_auth
         from agent_worker.claude_engine import credential_source, sdk_installed
 
         codex_credential = codex_login.credential_source(settings)
@@ -212,6 +243,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             "ok": True,
             "version": VERSION,
             "cursor": _engine_ready("cursor"),
+            # env, stored (PUT /auth/cursor/key) or none.
+            "cursor_credential": cursor_auth.credential_source(settings),
             "claude": {
                 "ready": _engine_ready("claude"),
                 "installed": sdk_installed(),
@@ -237,37 +270,78 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             },
         }
 
+    @app.get("/auth")
+    async def auth_overview() -> dict[str, Any]:
+        """Every engine's sign-in state in one call: ready, credential source, plan, a pending sign-in."""
+        return _auth_status()
+
+    # ---- Claude: `claude setup-token` (sign-in link, then the code from Anthropic's page) -------
+
     @app.post("/auth/claude/login")
     async def claude_login_start() -> dict[str, Any]:
         """Start Anthropic's `claude setup-token`; returns the sign-in link to open."""
         from agent_worker.claude_login import LoginError
 
+        _limit(login_starts, "claude")
         try:
             login = await _login_manager().start()
         except LoginError as exc:
             raise HTTPException(status_code=501 if exc.key == "cli_missing" else 502, detail=exc.key) from None
         return {
-            "id": login.id,
-            "url": login.link,
-            "next": f"Open the url, sign in, then POST the code Anthropic shows to /auth/claude/login/{login.id}.",
+            **login.as_dict(),
+            "next": f"Open the url, sign in, then POST {{\"code\": ...}} (the code Anthropic shows) to "
+            f"/auth/claude/login/{login.id}/code.",
         }
 
-    @app.post("/auth/claude/login/{login_id}")
+    @app.get("/auth/claude/login/{login_id}")
+    async def claude_login_status(login_id: str) -> dict[str, Any]:
+        """starting | awaiting_code | verifying | succeeded | failed | cancelled | expired."""
+        from agent_worker.claude_engine import credential_source
+        from agent_worker.claude_login import LoginError
+
+        try:
+            login = _login_manager().get(login_id)
+        except LoginError:
+            raise HTTPException(status_code=404, detail="expired") from None
+        body = login.as_dict()
+        if login.status == "succeeded":
+            body["credential"] = credential_source(settings)
+        return body
+
+    @app.post("/auth/claude/login/{login_id}/code")
+    @app.post("/auth/claude/login/{login_id}", include_in_schema=False)
     async def claude_login_finish(login_id: str, body: LoginCode) -> dict[str, Any]:
         """Hand over the code; the Claude Plan token is saved in the data volume (never returned or logged)."""
         from agent_worker.claude_engine import credential_source
-        from agent_worker.claude_login import LoginError, save_token
+        from agent_worker.claude_login import MAX_BAD_CODES, LoginError, save_token
 
+        manager_ = _login_manager()
         try:
-            token = await _login_manager().finish(login_id, body.code)
+            token = await manager_.finish(login_id, body.code)
         except LoginError as exc:
-            status = {"expired": 410, "bad_code": 400, "code_rejected": 400}.get(exc.key, 502)
-            raise HTTPException(status_code=status, detail=exc.key) from None
+            status = {
+                "expired": 410,
+                "bad_code": 400,
+                "code_rejected": 400,
+                "too_many_attempts": 429,
+                "busy": 409,
+                "timeout": 504,
+            }.get(exc.key, 502)
+            detail: Any = exc.key
+            if exc.key == "bad_code":
+                try:
+                    left = MAX_BAD_CODES - manager_.get(login_id).bad_codes
+                except LoginError:
+                    left = 0
+                detail = {"error": "bad_code", "attempts_left": max(0, left)}
+            raise HTTPException(status_code=status, detail=detail) from None
         save_token(settings.claude_token_path, token)
         logger.info("Claude sign-in finished; Plan token saved")
         source = credential_source(settings)
         return {
             "ok": True,
+            "id": login_id,
+            "status": "succeeded",
             "credential": source,
             "note": "Saved. Claude jobs use it now."
             if source == "signed-in"
@@ -281,15 +355,20 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     @app.delete("/auth/claude/token")
     async def claude_sign_out() -> dict[str, Any]:
         """Forget the signed-in Plan token (environment variables are not touched)."""
+        from agent_worker.claude_engine import credential_source
         from agent_worker.claude_login import forget_token
 
-        return {"removed": forget_token(settings.claude_token_path)}
+        removed = forget_token(settings.claude_token_path)
+        return {"removed": removed, "credential": credential_source(settings)}
+
+    # ---- Codex: "Sign in with ChatGPT" (device code) ---------------------------------------------
 
     @app.post("/auth/codex/login")
     async def codex_login_start() -> dict[str, Any]:
         """Start "Sign in with ChatGPT" for Codex (device code); returns the link and the code to enter."""
         from agent_worker.codex_login import DEVICE_AUTH_HINT, CodexLoginError
 
+        _limit(login_starts, "codex")
         try:
             login = await _codex_login_manager().start()
         except CodexLoginError as exc:
@@ -322,9 +401,64 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     @app.delete("/auth/codex/token")
     async def codex_sign_out() -> dict[str, Any]:
         """Forget the Codex sign-in (auth.json). OPENAI_API_KEY in the environment is not touched."""
-        from agent_worker.codex_login import forget_auth
+        from agent_worker.codex_login import credential_source, forget_auth
 
-        return {"removed": forget_auth(settings)}
+        removed = forget_auth(settings)
+        return {"removed": removed, "credential": credential_source(settings)}
+
+    # ---- Cursor: an API key, set at runtime ------------------------------------------------------
+
+    def _cursor_engine():
+        engines = getattr(engine, "engines", None)
+        return engines.get("cursor") if engines is not None else engine
+
+    def _cursor_changed() -> None:
+        reset = getattr(_cursor_engine(), "reset_credentials", None)
+        if reset is not None:
+            reset()
+
+    @app.put("/auth/cursor/key")
+    async def cursor_set_key(body: CursorKey) -> dict[str, Any]:
+        """Store a Cursor user API key in the data volume (never returned or logged)."""
+        from agent_worker import cursor_auth
+
+        _limit(key_updates, "cursor")
+        try:
+            key = cursor_auth.clean_key(body.api_key)
+        except cursor_auth.CursorKeyError:
+            raise HTTPException(status_code=400, detail="bad_key") from None
+        verified = False
+        if body.verify and cursor_auth.sdk_installed():
+            try:
+                await asyncio.wait_for(asyncio.to_thread(cursor_auth.verify_key, key), cursor_auth.VERIFY_SECONDS)
+            except cursor_auth.CursorKeyError as exc:
+                status = 400 if exc.key == "key_rejected" else 502
+                raise HTTPException(status_code=status, detail=exc.key) from None
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=502, detail="unreachable") from None
+            verified = True
+        cursor_auth.save_key(cursor_auth.key_path(settings), key)
+        _cursor_changed()
+        logger.info("Cursor API key stored%s", " (verified)" if verified else "")
+        source = cursor_auth.credential_source(settings)
+        return {
+            "ok": True,
+            "credential": source,
+            "verified": verified,
+            "note": "Saved. Cursor jobs use it now."
+            if source == "stored"
+            else "Saved, but CURSOR_API_KEY on the container wins over it.",
+        }
+
+    @app.delete("/auth/cursor/key")
+    async def cursor_clear_key() -> dict[str, Any]:
+        """Forget the stored key. CURSOR_API_KEY in the environment is not touched."""
+        from agent_worker import cursor_auth
+
+        removed = cursor_auth.forget_key(cursor_auth.key_path(settings))
+        if removed:
+            _cursor_changed()
+        return {"removed": removed, "credential": cursor_auth.credential_source(settings)}
 
     @app.get("/workspaces")
     async def workspaces() -> dict[str, Any]:

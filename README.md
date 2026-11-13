@@ -157,12 +157,12 @@ The same over HTTP, for scripts or a UI:
 
 ```bash
 curl -s -X POST localhost:8787/auth/claude/login -H "$H"                  # -> {"id": ..., "url": ...}
-curl -s -X POST localhost:8787/auth/claude/login/<id> -H "$H" \
+curl -s -X POST localhost:8787/auth/claude/login/<id>/code -H "$H" \
   -H 'Content-Type: application/json' -d '{"code": "<code from Anthropic>"}'   # saves the token
 curl -s -X DELETE localhost:8787/auth/claude/token -H "$H"                # sign out again
 ```
 
-The token is never returned or logged. The sign-in runs Anthropic's own `claude setup-token` in a temporary folder that is deleted afterwards. A code works once: if it is refused or older than 15 minutes, start again. `GET /health` shows which credential is in use (`claude.credential`: `env-plan`, `env-api`, `signed-in` or `none`).
+The token is never returned or logged. The sign-in runs Anthropic's own `claude setup-token` in a temporary folder that is deleted afterwards. A code works once: if it is refused or older than 15 minutes, start again. The full flow for a UI is in [Sign in from a UI](#sign-in-from-a-ui). `GET /health` shows which credential is in use (`claude.credential`: `env-plan`, `env-api`, `signed-in` or `none`).
 
 Anthropic's terms for the Agent SDK say third-party products should use API keys and not offer Claude.ai sign-in ([Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview), [Legal and compliance](https://code.claude.com/docs/en/legal-and-compliance)). Whether your own Plan token on your own worker is fine for you is your decision.
 
@@ -239,6 +239,96 @@ Only use `CODEX_SANDBOX=codex` if the container may create user namespaces (for 
 
 `CODEX_CONFIG` takes extra Codex settings, one `key=value` per line (TOML values, as with `codex -c`), for example a custom model provider. The Codex runtime makes the image about 450 MB larger.
 
+## Sign in from a UI
+
+A UI (for example AI Workspace) can offer a "Sign in" button for every engine without a terminal, `.env` edits or restarts. Every endpoint below needs `Authorization: Bearer <WORKER_TOKEN>`. Credentials are saved owner-only in the data volume (`/data/claude/oauth-token`, `/data/codex/auth.json`, `/data/cursor/api-key`), so they survive restarts. Jobs use them from the next job on. No response ever contains a token or key.
+
+Environment variables still win: `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` beat a Claude sign-in, and `CURSOR_API_KEY` beats a stored Cursor key. For Codex, a ChatGPT sign-in (`auth.json`) beats `OPENAI_API_KEY`. When a saved credential is hidden by the environment, the response says so in `note`, and `GET /auth` shows `env_override: true`.
+
+### One call for the status: `GET /auth`
+
+```json
+{
+  "default_engine": "cursor",
+  "configured": ["cursor", "claude", "codex"],
+  "engines": {
+    "cursor": {"ready": true, "installed": true, "credential": "stored", "kind": "api-key", "plan": null,
+               "stored": true, "env_override": false, "login": null, "method": "api_key"},
+    "claude": {"ready": false, "installed": true, "credential": "none", "kind": null, "plan": null,
+               "stored": false, "env_override": false, "method": "oauth_code",
+               "login": {"id": "Qm9…", "status": "awaiting_code", "url": "https://claude.com/cai/oauth/authorize?…", "expires_in": 812}},
+    "codex":  {"ready": true, "installed": true, "credential": "chatgpt", "kind": "subscription", "plan": "plus",
+               "stored": true, "env_override": false, "login": null, "method": "device_code"}
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `ready` | Jobs can run on this engine now. |
+| `credential` | Where the credential comes from. Cursor: `env`, `stored`, `none`. Claude: `env-plan`, `env-api`, `signed-in`, `none`. Codex: `chatgpt`, `api-key` (in auth.json), `env-api`, `none`. |
+| `kind` | `subscription` (Claude/ChatGPT plan), `api-key`, or `null`. |
+| `plan` | The ChatGPT plan for Codex (`plus`, `pro`, `team`, …). A Claude Plan token does not say which plan it belongs to, so Claude always shows `null`. |
+| `login` | A sign-in that is still waiting for the user (with its link and, for Codex, the code), else `null`. A UI can reload and pick it up again. |
+| `method` | Which button to show: `api_key` (a text field), `oauth_code` (link + paste a code), `device_code` (link + show a code). |
+
+`GET /health` (no token) shows the credential source too: `cursor_credential`, `claude.credential`, `codex.credential` and `codex.plan`. It never shows sign-in links.
+
+### Claude: link, then paste the code
+
+Anthropic's sign-in for Claude Code (`claude setup-token`) cannot redirect back to the worker. After sign-in, Anthropic's page shows a code, and the user pastes it into the UI.
+
+1. `POST /auth/claude/login` starts the sign-in. It takes a few seconds and answers:
+   ```json
+   {"id": "Qm9…", "status": "awaiting_code", "url": "https://claude.com/cai/oauth/authorize?code=true&…", "expires_in": 900,
+    "next": "Open the url, sign in, then POST {\"code\": ...} (the code Anthropic shows) to /auth/claude/login/Qm9…/code."}
+   ```
+   Open `url` in a new tab. Anthropic shows a code after sign-in.
+2. `POST /auth/claude/login/{id}/code` with `{"code": "<code from Anthropic>"}` (takes up to a minute):
+   ```json
+   {"ok": true, "id": "Qm9…", "status": "succeeded", "credential": "signed-in", "note": "Saved. Claude jobs use it now."}
+   ```
+   Errors (`detail`): `400 {"error": "bad_code", "attempts_left": 4}` means it doesn't look like a code, and the sign-in stays open. `400 code_rejected` means Anthropic refused it, and the sign-in has ended. `429 too_many_attempts` comes after 5 malformed codes. `409 busy` means a code is already being checked. `410 expired` means unknown, finished, replaced or older than 15 minutes. `504 timeout`.
+3. Optional: `GET /auth/claude/login/{id}` returns the state: `awaiting_code`, `verifying`, `succeeded` (with `credential`), `failed` (with `error`), `cancelled` or `expired`. It returns `404` for an unknown id.
+4. `DELETE /auth/claude/login/{id}` cancels (204). `DELETE /auth/claude/token` signs out: `{"removed": true, "credential": "none"}`.
+
+`POST /auth/claude/login/{id}` (without `/code`) still works for older clients.
+
+### Codex: link and a code to enter
+
+1. `POST /auth/codex/login`:
+   ```json
+   {"id": "x7…", "status": "pending", "url": "https://auth.openai.com/codex/device", "code": "ABCD-1234", "expires_in": 900, "next": "…"}
+   ```
+   Show the code and open `url`. The user signs in to ChatGPT and enters the code. Device-code sign-in has to be enabled once in ChatGPT's Settings → Security.
+2. Poll `GET /auth/codex/login/{id}?wait=60` (long poll, up to 120 s) until `status` is no longer `pending`:
+   ```json
+   {"id": "x7…", "status": "succeeded", "url": "…", "code": "ABCD-1234", "credential": "chatgpt"}
+   ```
+   Other outcomes: `failed` (with `error`), `cancelled`, `expired`. An unknown id gives `404`.
+3. `DELETE /auth/codex/login/{id}` cancels (204). `DELETE /auth/codex/token` signs out: `{"removed": true, "credential": "none"}`.
+
+### Cursor: an API key
+
+Cursor has no sign-in flow for headless use. The user creates a user API key at [cursor.com/dashboard/integrations](https://cursor.com/dashboard/integrations) and pastes it into the UI.
+
+1. `PUT /auth/cursor/key` with `{"api_key": "key_…", "verify": true}`. With `verify` (the default), the worker first asks Cursor for the key's model list:
+   ```json
+   {"ok": true, "credential": "stored", "verified": true, "note": "Saved. Cursor jobs use it now."}
+   ```
+   Errors (`detail`): `400 bad_key` (not shaped like a key), `400 key_rejected` (Cursor refused it), `502 unreachable` (Cursor could not be asked; send `"verify": false` to store it anyway). A refused key is not stored.
+2. `DELETE /auth/cursor/key` gives `{"removed": true, "credential": "none"}` (or `"env"` if `CURSOR_API_KEY` is set).
+
+### Limits
+
+- One sign-in per engine at a time. Starting a new one cancels the old one.
+- A sign-in nobody finishes is stopped after 15 minutes. For Claude, the `claude setup-token` process is killed and its temporary folder deleted.
+- `429 {"error": "rate_limited", "retry_after": N}` (plus a `Retry-After` header): at most 6 sign-in starts per engine and 10 Cursor key updates per 10 minutes.
+
+### MCP
+
+The MCP endpoint has one read-only tool, `auth_status`, with the same overview as `GET /auth`. It leaves out sign-in links and codes, so a model that reads it cannot finish a sign-in for someone else. Nothing on MCP can set, change or remove a credential.
+
 ## Model and workspace from the chat side
 
 - `model` picks the model, for example `composer-2.5` or `gpt-5` for Cursor, `claude-opus-5-5` for Claude Code, or `gpt-5.5` for Codex. If it is empty, `CURSOR_MODEL`, `CLAUDE_MODEL` or `CODEX_MODEL` is used.
@@ -254,6 +344,8 @@ Only use `CODEX_SANDBOX=codex` if the container may create user namespaces (for 
 - `status: "needs_approval"`: a command on an approval host is waiting for the user (see [Approval for selected hosts](#approval-for-selected-hosts)).
 - `session`: calls with the same session reuse the same agent, so follow-ups remember earlier turns.
 - `mcp_servers`: extra HTTP/SSE MCP servers for this task, in `{"name": {"url": ..., "headers": {...}}}` format.
+
+`auth_status()` (read-only) shows which engines are signed in. See [Sign in from a UI](#sign-in-from-a-ui).
 
 ## Job API
 
@@ -343,7 +435,7 @@ The guard sees what the agent runs with the normal commands. It is a guardrail f
 - **Token:** Without `WORKER_TOKEN`, the worker answers only when it listens on loopback and the `Host` header is loopback. Otherwise every request is refused.
 - **`TOOL_PROFILE`** is the upper limit (`full` > `local` > `offline` > `mcp` > `none`). Requests can narrow it but never widen it.
 - **The agent can do whatever its tools allow inside the container,** including running shell commands, without asking. Treat the token like a shell login on the container. Don't mount anything you wouldn't hand to a shell.
-- **Codex's `auth.json`** in `/data/codex` holds ChatGPT tokens. Like the Claude token in `/data/claude`, it lives in the data volume and is readable by the agent's shell (same user). Don't give the worker a volume or token you wouldn't give that shell.
+- **Codex's `auth.json`** in `/data/codex` holds ChatGPT tokens. Like the Claude token in `/data/claude` and a Cursor key set over the API in `/data/cursor`, it lives in the data volume and is readable by the agent's shell (same user). Don't give the worker a volume or token you wouldn't give that shell.
 - **MCP servers sent with a request** must be HTTP/SSE. Stdio servers (which start processes) and `${ENV}` substitution are only allowed in `/data/mcp.json`. Set `ALLOW_REQUEST_MCP=false` to accept only that file.
 - **SSH:** The guard listens only to callers inside the container. The worker's keys never leave the container, and requests cannot send SSH keys or config. See [SSH to your servers](#ssh-to-your-servers) for what approvals do and don't cover.
 - **Loops:** The worker adds `X-Agent-Worker-Depth` to every HTTP MCP server it hands to an agent. If an agent calls a worker back through MCP, that call is refused (`MAX_CALL_DEPTH`, default 1).

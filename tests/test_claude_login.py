@@ -173,7 +173,7 @@ def test_endpoints_save_the_token_and_never_return_it(settings, fake_cli, monkey
         assert load_token(secured.claude_token_path) == TOKEN
         assert oct(secured.claude_token_path.stat().st_mode & 0o777) == "0o600"
         assert client.get("/health").json()["claude"]["credential"] == "signed-in"
-        assert client.delete("/auth/claude/token", headers=auth).json() == {"removed": True}
+        assert client.delete("/auth/claude/token", headers=auth).json() == {"removed": True, "credential": "none"}
         assert load_token(secured.claude_token_path) == ""
 
 

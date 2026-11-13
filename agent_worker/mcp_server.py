@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from mcp import types as mtypes
 from mcp.server.mcpserver import Context, MCPServer
@@ -23,7 +23,8 @@ INSTRUCTIONS = (
     "Agent Worker runs coding tasks on a coding agent (Cursor or Claude Code) in a workspace folder on the "
     "worker's machine. Use agent_run for work that needs files, a shell, a repository or several steps. "
     "Long tasks return a job_id while still running: poll it with agent_job, stop it with agent_cancel. "
-    "Status needs_approval means a remote command waits for the user: show it to them and let them decide."
+    "Status needs_approval means a remote command waits for the user: show it to them and let them decide. "
+    "auth_status tells which engines are signed in; signing in is up to the user (UI or HTTP API)."
 )
 
 _MAX_WAIT = 600
@@ -135,8 +136,15 @@ def _engines_note(engine) -> str:
     return "engine picks the agent: " + ", ".join(names) + ". Leave it empty for the default."
 
 
-def build_mcp(manager: JobManager) -> MCPServer:
+def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | None = None) -> MCPServer:
+    """auth_status: the read-only sign-in overview (without links or codes); default: built from the engine."""
     settings = manager.settings
+    if auth_status is None:
+        from agent_worker.auth import auth_status as overview
+
+        def auth_status() -> dict[str, Any]:
+            return overview(settings, manager.engine, reveal=False)
+
     server = MCPServer(name="agent-worker", instructions=INSTRUCTIONS)
     engines_note = _engines_note(manager.engine)
 
@@ -319,6 +327,17 @@ def build_mcp(manager: JobManager) -> MCPServer:
             wait = settings.mcp_wait_seconds if wait_seconds is None else wait_seconds
             asked = await _wait(job, wait, ctx)
             return asked if asked is not None else payload(job, recent=5)
+
+    @server.tool(
+        name="auth_status",
+        annotations=mtypes.ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+        description=(
+            "Read-only: which engines are signed in and ready (credential source, plan when known, whether a "
+            "sign-in is waiting). Signing in is done by the user in a UI or over the worker's HTTP API, not here."
+        )
+    )
+    async def auth_status_tool() -> dict[str, Any]:
+        return auth_status()
 
     @server.tool(description="Workspaces the agents can use, and which one is the default.")
     async def agent_workspaces() -> dict[str, Any]:

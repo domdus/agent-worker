@@ -20,7 +20,7 @@ def _data(result):
 async def test_tools_are_listed(settings, engine):
     async with Client(build_mcp(_manager(settings, engine))) as client:
         names = {tool.name for tool in (await client.list_tools()).tools}
-    assert names == {"agent_run", "agent_job", "agent_cancel", "agent_workspaces"}
+    assert names == {"agent_run", "agent_job", "agent_cancel", "agent_workspaces", "auth_status"}
 
 
 async def test_agent_run_returns_the_result(settings, engine):

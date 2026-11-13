@@ -243,6 +243,8 @@ class CodexLogin:
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"id": self.id, "status": self.status, "url": self.url, "code": self.code}
+        if self.status == "pending":
+            out["expires_in"] = max(0, int(LOGIN_TTL_SECONDS - (time.monotonic() - self.created)))
         if self.error:
             out["error"] = self.error
         return out
@@ -326,6 +328,11 @@ class CodexLoginManager:
         login.task = asyncio.create_task(login.watch(), name="codex-login")
         self._current = login
         return login
+
+    def current(self) -> CodexLogin | None:
+        """The sign-in that still waits for the user to enter the code, if any."""
+        login = self._current
+        return login if login is not None and login.status == "pending" else None
 
     def get(self, login_id: str) -> CodexLogin:
         login = self._current
