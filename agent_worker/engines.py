@@ -8,9 +8,9 @@ from agent_worker.engine import Emit, Engine, EngineError, Outcome, RunSpec
 
 logger = logging.getLogger(__name__)
 
-# How the engines show up in /v1 model ids: "claude-code/claude-sonnet-5-5". Cursor ids stay bare,
-# because Cursor itself offers Claude models under names such as "claude-4.5-sonnet".
-MODEL_PREFIX = {"claude": "claude-code/"}
+# How the engines show up in /v1 model ids: "claude-code/claude-sonnet-5-5", "codex/gpt-5.5". Cursor ids
+# stay bare, because Cursor itself offers Claude and GPT models under names such as "claude-4.5-sonnet".
+MODEL_PREFIX = {"claude": "claude-code/", "codex": "codex/"}
 
 
 class EngineRouter:
@@ -42,7 +42,12 @@ class EngineRouter:
         settings = getattr(self.engines[engine], "settings", None)
         if settings is None:
             return ""
-        return settings.claude_model if engine == "claude" else settings.model
+        if engine == "claude":
+            return settings.claude_model
+        if engine == "codex":
+            # Empty: Codex picks the account's default; the job shows the real one when it ends.
+            return settings.codex_model
+        return settings.model
 
     async def run(self, spec: RunSpec, emit: Emit) -> Outcome:
         return await self.engines[spec.engine].run(spec, emit)
@@ -67,7 +72,8 @@ class EngineRouter:
 
 
 def split_engine(model: str) -> tuple[str, str]:
-    """'claude-code/claude-opus-5-5' -> ('claude', 'claude-opus-5-5'); anything else -> ('', model)."""
+    """'claude-code/claude-opus-5-5' -> ('claude', 'claude-opus-5-5'), 'codex/gpt-5.5' -> ('codex', 'gpt-5.5');
+    anything else -> ('', model)."""
     name = (model or "").strip()
     for engine, prefix in MODEL_PREFIX.items():
         if name == prefix.rstrip("/"):

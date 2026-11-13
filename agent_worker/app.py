@@ -93,11 +93,16 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     store = Store(settings.data_dir / "worker.sqlite")
     if engine is None:
         from agent_worker.claude_engine import ClaudeEngine
+        from agent_worker.codex_engine import CodexEngine
         from agent_worker.engines import EngineRouter
 
         ids = (store.agent_id, store.set_agent_id)
         engine = EngineRouter(
-            {"cursor": CursorEngine(settings, ids), "claude": ClaudeEngine(settings, ids)},
+            {
+                "cursor": CursorEngine(settings, ids),
+                "claude": ClaudeEngine(settings, ids),
+                "codex": CodexEngine(settings, ids),
+            },
             settings.default_engine,
         )
     manager = JobManager(settings, engine, store)
@@ -114,10 +119,15 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        from agent_worker.codex_login import seed_auth
         from agent_worker.git_bootstrap import GitBootstrapError, bootstrap_git
         from agent_worker.ssh_setup import prepare_environment, setup_ssh
 
         prepare_environment(settings)
+        try:
+            seed_auth(settings)
+        except OSError as exc:
+            logger.error("Could not copy CODEX_AUTH_JSON into %s: %s", settings.codex_home, exc)
         try:
             app.state.ssh = setup_ssh()
         except OSError as exc:
@@ -131,7 +141,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             logger.error("Could not set up GIT_REPO in the default workspace: %s", exc)
         if not engine.available:
             logger.warning(
-                "Neither CURSOR_API_KEY nor a Claude credential is set. Jobs will fail until one is."
+                "No engine is set up (CURSOR_API_KEY, a Claude credential or a Codex sign-in). "
+                "Jobs will fail until one is."
             )
         if not settings.token and not settings.open_without_token():
             logger.warning("No WORKER_TOKEN and HOST=%s: every request is refused until a token is set.", settings.host)
@@ -143,6 +154,9 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
                 login = getattr(app.state, "claude_login", None)
                 if login is not None:
                     login.close()
+                codex_login = getattr(app.state, "codex_login", None)
+                if codex_login is not None:
+                    await codex_login.aclose()
                 await engine.aclose()
                 store.close()
 
@@ -179,9 +193,19 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             app.state.claude_login = LoginManager()
         return app.state.claude_login
 
+    def _codex_login_manager():
+        from agent_worker.codex_login import CodexLoginManager
+
+        if getattr(app.state, "codex_login", None) is None:
+            app.state.codex_login = CodexLoginManager(settings)
+        return app.state.codex_login
+
     @app.get("/health")
     async def health() -> dict[str, Any]:
+        from agent_worker import codex_login
         from agent_worker.claude_engine import credential_source, sdk_installed
+
+        codex_credential = codex_login.credential_source(settings)
 
         default = engine.default() if hasattr(engine, "default") else "cursor"
         return {
@@ -193,6 +217,14 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
                 "installed": sdk_installed(),
                 "credential": credential_source(settings),
                 "model": settings.claude_model,
+            },
+            "codex": {
+                "ready": _engine_ready("codex"),
+                "installed": codex_login.sdk_installed() and bool(codex_login.cli_path()),
+                "credential": codex_credential,
+                "plan": codex_login.auth_info(settings.codex_auth_path)["plan"] if codex_credential == "chatgpt" else None,
+                "model": settings.codex_model or None,
+                "sandbox": settings.codex_sandbox,
             },
             "default_engine": default,
             "model": settings.model,
@@ -252,6 +284,47 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
         from agent_worker.claude_login import forget_token
 
         return {"removed": forget_token(settings.claude_token_path)}
+
+    @app.post("/auth/codex/login")
+    async def codex_login_start() -> dict[str, Any]:
+        """Start "Sign in with ChatGPT" for Codex (device code); returns the link and the code to enter."""
+        from agent_worker.codex_login import DEVICE_AUTH_HINT, CodexLoginError
+
+        try:
+            login = await _codex_login_manager().start()
+        except CodexLoginError as exc:
+            status = 501 if exc.key == "cli_missing" else 502
+            raise HTTPException(status_code=status, detail={"error": exc.key, "hint": DEVICE_AUTH_HINT}) from None
+        return {
+            **login.as_dict(),
+            "next": f"Open the url, sign in to ChatGPT and enter the code. Then GET /auth/codex/login/{login.id}?wait=60.",
+        }
+
+    @app.get("/auth/codex/login/{login_id}")
+    async def codex_login_status(login_id: str, wait: int = 0) -> dict[str, Any]:
+        """pending | succeeded | failed | cancelled | expired. The tokens stay in the data volume."""
+        from agent_worker.codex_login import CodexLoginError, credential_source
+
+        try:
+            login = await _codex_login_manager().wait(login_id, min(max(wait, 0), 120))
+        except CodexLoginError:
+            raise HTTPException(status_code=404, detail="expired") from None
+        body = login.as_dict()
+        if login.status == "succeeded":
+            logger.info("Codex sign-in finished; auth.json saved")
+            body["credential"] = credential_source(settings)
+        return body
+
+    @app.delete("/auth/codex/login/{login_id}", status_code=204)
+    async def codex_login_cancel(login_id: str) -> None:
+        await _codex_login_manager().cancel(login_id)
+
+    @app.delete("/auth/codex/token")
+    async def codex_sign_out() -> dict[str, Any]:
+        """Forget the Codex sign-in (auth.json). OPENAI_API_KEY in the environment is not touched."""
+        from agent_worker.codex_login import forget_auth
+
+        return {"removed": forget_auth(settings)}
 
     @app.get("/workspaces")
     async def workspaces() -> dict[str, Any]:

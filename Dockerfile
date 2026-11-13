@@ -4,13 +4,14 @@ ARG VERSION=dev
 
 LABEL \
   org.opencontainers.image.source="https://github.com/domdus/agent-worker" \
-  org.opencontainers.image.description="Headless coding agent (Cursor SDK or Claude Code): MCP tool, job API and OpenAI-compatible chat" \
+  org.opencontainers.image.description="Headless coding agent (Cursor SDK, Claude Code or OpenAI Codex): MCP tool, job API and OpenAI-compatible chat" \
   org.opencontainers.image.licenses="MIT" \
   org.opencontainers.image.version="${VERSION}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DATA_DIR=/data \
+    CODEX_HOME=/data/codex \
     HOST=0.0.0.0 \
     PORT=8787
 
@@ -22,7 +23,11 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# The Codex CLI pinned with the SDK (statically linked) also goes on PATH as `codex` for manual use.
+# Its smoke test runs in a throwaway CODEX_HOME: /data/codex is created later by the worker user.
+RUN pip install --no-cache-dir -r requirements.txt \
+    && ln -s "$(python -c 'from codex_cli_bin import bundled_codex_path; print(bundled_codex_path())')" /usr/local/bin/codex \
+    && CODEX_HOME=/tmp/codex-check codex --version && rm -rf /tmp/codex-check
 COPY agent_worker ./agent_worker
 
 USER worker

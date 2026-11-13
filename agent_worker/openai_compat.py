@@ -63,7 +63,7 @@ def model_engine(raw: str) -> tuple[str, str, str]:
 
     model, workspace = split_model(raw)
     engine, model = split_engine(model)
-    if engine and model in {"", "claude", "claude-code"}:
+    if engine and model in {"", "claude", "claude-code", "codex", "default"}:
         model = ""
     return engine, model, workspace
 

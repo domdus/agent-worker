@@ -12,8 +12,11 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 # than TOOL_PROFILE on the container.
 TOOL_PROFILES = ("full", "local", "offline", "mcp", "none")
 # Agent engines a job can run on.
-ENGINES = ("cursor", "claude")
+ENGINES = ("cursor", "claude", "codex")
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
+# How Codex jobs are confined: "container" (the container is the sandbox, Codex runs with full access)
+# or "codex" (Codex's own bubblewrap sandbox; needs user namespaces in the container).
+CODEX_SANDBOXES = ("container", "codex")
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -40,6 +43,11 @@ def _patterns(raw: str) -> tuple[str, ...]:
 def _engine(raw: str) -> str:
     value = (raw or "").strip().lower()
     return value if value in ENGINES else ""
+
+
+def _codex_sandbox(raw: str) -> str:
+    value = (raw or "").strip().lower()
+    return value if value in CODEX_SANDBOXES else "container"
 
 
 def _profile(raw: str) -> str:
@@ -79,8 +87,18 @@ class Settings:
     claude_oauth_token: str = ""
     anthropic_api_key: str = ""
     claude_model: str = DEFAULT_CLAUDE_MODEL
-    # Engine for jobs that do not name one. Empty: cursor, or claude when only Claude is set up.
+    # Engine for jobs that do not name one. Empty: cursor, or the first other engine that is set up.
     default_engine: str = ""
+    # OpenAI Codex (openai-codex SDK): "Sign in with ChatGPT" (auth.json in CODEX_HOME) first, then an
+    # OpenAI API key. Empty model: Codex's own default for the account.
+    openai_api_key: str = ""
+    codex_model: str = ""
+    codex_home_dir: Path | None = None
+    # An auth.json to seed CODEX_HOME with (path to a mounted file, or the JSON itself).
+    codex_auth_json: str = ""
+    codex_sandbox: str = "container"
+    # Extra `--config key=value` lines for Codex (TOML values), e.g. a custom model provider.
+    codex_config: tuple[str, ...] = ()
 
     @property
     def claude_token_path(self) -> Path:
@@ -91,6 +109,15 @@ class Settings:
     def claude_config_dir(self) -> Path:
         """Claude Code's own state (sessions for resume). Never the user's ~/.claude."""
         return self.data_dir / "claude" / "config"
+
+    @property
+    def codex_home(self) -> Path:
+        """CODEX_HOME: auth.json, sessions for resume and Codex's own state. In the data volume."""
+        return self.codex_home_dir or self.data_dir / "codex"
+
+    @property
+    def codex_auth_path(self) -> Path:
+        return self.codex_home / "auth.json"
 
     def needs_approval(self, *names: str) -> bool:
         from fnmatch import fnmatchcase
@@ -117,6 +144,7 @@ class Settings:
         # WORKSPACE_DIR binds the default workspace to one host folder, like the HA runtime did.
         single = os.environ.get("WORKSPACE_DIR", "").strip()
         configured = os.environ.get("MCP_CONFIG_PATH", "").strip()
+        codex_home = os.environ.get("CODEX_HOME", "").strip()
         return cls(
             data_dir=data_dir,
             workspaces_dir=workspaces_dir,
@@ -145,6 +173,14 @@ class Settings:
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip(),
             claude_model=os.environ.get("CLAUDE_MODEL", "").strip() or DEFAULT_CLAUDE_MODEL,
             default_engine=_engine(os.environ.get("DEFAULT_ENGINE", "")),
+            openai_api_key=(os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("CODEX_API_KEY", "").strip()),
+            codex_model=os.environ.get("CODEX_MODEL", "").strip(),
+            codex_home_dir=Path(codex_home).resolve() if codex_home else None,
+            codex_auth_json=os.environ.get("CODEX_AUTH_JSON", "").strip(),
+            codex_sandbox=_codex_sandbox(os.environ.get("CODEX_SANDBOX", "")),
+            codex_config=tuple(
+                line.strip() for line in os.environ.get("CODEX_CONFIG", "").splitlines() if "=" in line and line.strip()
+            ),
         )
 
 

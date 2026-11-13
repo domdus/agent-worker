@@ -1,7 +1,10 @@
-# Agent Worker: a headless Cursor agent for anything that speaks MCP or the OpenAI API.
+# Agent Worker: a headless coding agent (Cursor, Claude Code or OpenAI Codex) for anything that
+# speaks MCP or the OpenAI API.
 #
-#   cp .env.example .env      # paste CURSOR_API_KEY, generate WORKER_TOKEN
+#   cp .env.example .env      # paste CURSOR_API_KEY and/or OPENAI_API_KEY, generate WORKER_TOKEN
 #   docker compose up -d
+#   # Codex with your ChatGPT plan instead of an API key (link + one-time code; kept in the volume):
+#   docker exec -it agent-worker python -m agent_worker.codex_login
 #
 # MCP:      http://<host>:8787/mcp            (Hermes, Claude Code, Open WebUI tools, AI Workspace)
 # OpenAI:   http://<host>:8787/v1             (Open WebUI connection, any OpenAI client)
@@ -27,12 +30,19 @@ services:
       # - /path/to/project:/workspace
       # MCP servers every job gets (stdio allowed here, not from requests):
       # - ./mcp.json:/data/mcp.json:ro
+      # Codex: an auth.json from `codex login` on another computer, copied into /data/codex once
+      # (set CODEX_AUTH_JSON=/run/secrets/codex_auth.json in .env):
+      # - ~/.codex/auth.json:/run/secrets/codex_auth.json:ro
       # Git key for GIT_REPO over SSH:
       # - ~/.ssh/id_ed25519:/run/secrets/git_ssh:ro
       # SSH to servers (SSH_KEY / SSH_CONFIG / SSH_KNOWN_HOSTS in .env point here):
       # - ./ssh/worker_key:/run/secrets/worker_ssh_key:ro
       # - ./ssh/config:/run/secrets/ssh_config:ro
       # - ./ssh/known_hosts:/run/secrets/known_hosts:ro
+    # Only with CODEX_SANDBOX=codex: let Codex's own sandbox (bubblewrap) create user namespaces.
+    # security_opt:
+    #   - seccomp=unconfined
+    #   - apparmor=unconfined
     restart: unless-stopped
 
   # Optional: Open WebUI already wired to the worker. `docker compose --profile webui up -d`

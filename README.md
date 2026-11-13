@@ -1,20 +1,20 @@
 # Agent Worker
 
-A headless coding agent in a Docker container: Cursor or Claude Code. You give it a task, it works in a workspace folder (files, shell, git, MCP), and returns the result, the changed files and any commits.
+A headless coding agent in a Docker container: Cursor, Claude Code or OpenAI Codex. You give it a task, it works in a workspace folder (files, shell, git, MCP), and returns the result, the changed files and any commits.
 
 It has three ways in, all on one port and protected by one token:
 
 | Endpoint | For | What it is |
 |---|---|---|
 | `/mcp` | Hermes, Claude Code, Open WebUI tools, AI Workspace, any MCP client | MCP server (Streamable HTTP) with an `agent_run` tool |
-| `/v1` | Open WebUI, any OpenAI client | OpenAI-compatible `chat/completions` and `models`, so Cursor and Claude Code show up as chat models |
+| `/v1` | Open WebUI, any OpenAI client | OpenAI-compatible `chat/completions` and `models`, so Cursor, Claude Code and Codex show up as chat models |
 | `/jobs` | Scripts, CI, your own apps | Start a job, check it, stream its events, cancel it |
 
-It runs on the official [Cursor SDK](https://cursor.com/docs) with your own `CURSOR_API_KEY`. Usage is billed to that Cursor account. It can also run **Claude Code** (Anthropic's [Claude Agent SDK](https://pypi.org/project/claude-agent-sdk/)) with your Claude plan or an Anthropic API key: see [Claude Code](#claude-code). Each job picks one engine.
+It runs on the official [Cursor SDK](https://cursor.com/docs) with your own `CURSOR_API_KEY`. Usage is billed to that Cursor account. It can also run **Claude Code** (Anthropic's [Claude Agent SDK](https://pypi.org/project/claude-agent-sdk/)) with your Claude plan or an Anthropic API key: see [Claude Code](#claude-code). And it can run **OpenAI Codex** (the official [Codex SDK](https://pypi.org/project/openai-codex/)) with your ChatGPT plan or an OpenAI API key: see [OpenAI Codex](#openai-codex). Each job picks one engine.
 
 ## Installation
 
-You need Docker with Compose, and a Cursor user API key from [cursor.com/dashboard/integrations](https://cursor.com/dashboard/integrations) and/or a Claude credential (see [Claude Code](#claude-code)). The image `ghcr.io/domdus/agent-worker` is built for amd64 and arm64.
+You need Docker with Compose, and a Cursor user API key from [cursor.com/dashboard/integrations](https://cursor.com/dashboard/integrations) and/or a Claude credential (see [Claude Code](#claude-code)) and/or a ChatGPT plan or OpenAI API key (see [OpenAI Codex](#openai-codex)). The image `ghcr.io/domdus/agent-worker` is built for amd64 and arm64.
 
 ### 1. Make a folder with two files
 
@@ -118,7 +118,7 @@ Until 0.2.0 this project was **cursor-worker** with `cursor_*` tools. From 0.3.0
 
 There are two ways to connect it, and you can use both:
 
-- **As a model:** Admin Settings → Connections → OpenAI API. URL `http://agent-worker:8787/v1` (or `http://host.docker.internal:8787/v1`), API key = `WORKER_TOKEN`. Cursor's models and the `claude-code/…` models show up in the model picker. The agent's steps appear as "thinking", and the stop button cancels the job.
+- **As a model:** Admin Settings → Connections → OpenAI API. URL `http://agent-worker:8787/v1` (or `http://host.docker.internal:8787/v1`), API key = `WORKER_TOKEN`. Cursor's models and the `claude-code/…` and `codex/…` models show up in the model picker. The agent's steps appear as "thinking", and the stop button cancels the job.
 - **As a tool for other models:** Admin Settings → External Tools → add an MCP server (Streamable HTTP) at `.../mcp` with Bearer auth.
 
 `docker compose --profile webui up -d` starts Open WebUI already connected to the worker.
@@ -168,18 +168,80 @@ Anthropic's terms for the Agent SDK say third-party products should use API keys
 
 ### Choosing the engine
 
-- **Jobs:** `"engine": "claude"` (or `"cursor"`) in `POST /jobs`.
+- **Jobs:** `"engine": "claude"`, `"codex"` (or `"cursor"`) in `POST /jobs`.
 - **MCP:** the `engine` argument of `agent_run`.
-- **`/v1`:** Claude models are listed as `claude-code/claude-sonnet-5-5` and so on, and `claude-code/<model>@workspace` works like the Cursor names. Cursor's own Claude models (for example `claude-4.5-sonnet`) still run on Cursor.
-- Without one, `DEFAULT_ENGINE` is used, else Cursor, else Claude when only Claude is set up.
+- **`/v1`:** Claude models are listed as `claude-code/claude-sonnet-5-5` and so on, and `claude-code/<model>@workspace` works like the Cursor names. Cursor's own Claude models (for example `claude-4.5-sonnet`) still run on Cursor. Codex models are listed as `codex/<model>` (`codex` alone means Codex's default model); `codex/<model>@workspace` works too.
+- Without one, `DEFAULT_ENGINE` (`cursor`, `claude` or `codex`) is used, else Cursor, else the first other engine that is set up.
 
 `CLAUDE_MODEL` (default `claude-sonnet-5-5`) is the model when a Claude job names none. The tool profiles mean the same as for Cursor: `full` has files, the shell and the web; `local` has no web search or fetch; `offline` has no shell either; `mcp` has only MCP tools; `none` is chat only. Effort `fast`, `high` and `high_fast` become Claude Code's low, high and medium effort. A `session` resumes the Claude Code conversation; its state is kept in `/data/claude/config`.
 
 Claude Code makes the image about 500 MB larger.
 
+## OpenAI Codex
+
+Jobs can also run on OpenAI Codex. The image includes the official Python [Codex SDK](https://pypi.org/project/openai-codex/) (`openai-codex`) and the Codex CLI pinned with it, so no Node.js is needed. Each job starts its own `codex app-server` in the job's workspace and talks to it over JSON-RPC, with the same tool profiles, workspaces, sessions, MCP servers, SSH guard and approvals as the other engines. It loads no `AGENTS.md`, skills, hooks, plugins, apps or memories.
+
+### Credentials
+
+The first one found wins:
+
+| Where | What |
+|---|---|
+| `/data/codex/auth.json` | "Sign in with ChatGPT": uses your ChatGPT plan (Plus, Pro, Business, …). Written by the sign-in below, or copied from `CODEX_AUTH_JSON`. An API key saved by `codex login --with-api-key` also lives here. |
+| `OPENAI_API_KEY` (or `CODEX_API_KEY`) | An OpenAI API key, billed as API usage. Handed to Codex in memory for each job and never written to disk. |
+
+`CODEX_HOME` is `/data/codex`, in the data volume, so the sign-in survives restarts and image updates. Codex refreshes the ChatGPT tokens in `auth.json` by itself while it works, so the file must stay writable. Treat it like a password. The worker blanks its own secrets (`OPENAI_API_KEY`, `CURSOR_API_KEY`, `ANTHROPIC_API_KEY`, `WORKER_TOKEN`, …) in Codex's environment, so the agent's shell can't read them.
+
+### Sign in with ChatGPT
+
+Device-code sign-in has to be switched on once: enable device code login in ChatGPT's **Settings → Security** (for a workspace account, the admin allows it in the workspace permissions). Then:
+
+```bash
+docker exec -it agent-worker python -m agent_worker.codex_login          # runs `codex login --device-auth`
+docker exec -it agent-worker python -m agent_worker.codex_login status   # who is signed in
+docker exec -it agent-worker python -m agent_worker.codex_login logout   # removes auth.json
+```
+
+It prints a link (`https://auth.openai.com/codex/device`) and a one-time code. Open the link on any device, sign in with the ChatGPT account that has your plan, and enter the code. `auth.json` goes to `/data/codex/` and is used from the next job on. No restart is needed.
+
+The same over HTTP, for scripts or a UI:
+
+```bash
+curl -s -X POST localhost:8787/auth/codex/login -H "$H"            # -> {"id", "url", "code", "status": "pending"}
+curl -s "localhost:8787/auth/codex/login/<id>?wait=60" -H "$H"     # -> "succeeded" once the code was entered
+curl -s -X DELETE localhost:8787/auth/codex/login/<id> -H "$H"     # cancel
+curl -s -X DELETE localhost:8787/auth/codex/token -H "$H"          # sign out (removes auth.json)
+```
+
+**Already signed in on another computer?** Run `codex login` there and hand the worker a copy of `~/.codex/auth.json`: mount it read-only and set `CODEX_AUTH_JSON=/run/secrets/codex_auth.json`. You can also put the JSON itself in the variable. The worker copies it into `/data/codex/auth.json` once, when there is none yet, and from then on Codex refreshes that copy. Don't keep using the same `auth.json` on two machines: a refresh on one can sign the other out. To swap the account later, `codex_login logout` first.
+
+`GET /health` shows `codex.credential` (`chatgpt`, `api-key`, `env-api` or `none`), the ChatGPT `plan`, `installed`, `ready`, `model` and `sandbox`.
+
+### Models, tools and sandbox
+
+- `CODEX_MODEL` is the model when a Codex job names none. If it's empty, Codex uses its own default for the account, and the job shows which model ran. A job can still name any model (`"model": "gpt-5.5"`).
+- Effort `fast`, `high` and `high_fast` become Codex's `low`, `high` and `medium` reasoning effort. Codex's own names (`minimal`, `xhigh`, …) pass through as they are.
+- A `session` continues the Codex thread across jobs and restarts. Threads are stored in `/data/codex/sessions`. A job without a session leaves no thread behind.
+- MCP servers from `/data/mcp.json` and from the request are passed on: stdio and Streamable HTTP, with headers. Codex can't use SSE-only servers. The job skips them and says so in a status event.
+- Codex's own Linux sandbox (bubblewrap) needs user namespaces, which a normal Docker container doesn't allow. So by default (`CODEX_SANDBOX=container`) the container is the sandbox, as it is for Cursor and Claude Code, and Codex runs with full access inside it. Nothing asks for approval: whatever would ask is refused.
+
+| Profile | `CODEX_SANDBOX=container` (default) | `CODEX_SANDBOX=codex` |
+|---|---|---|
+| `full` | shell, file edits, live web search, MCP | the same, but commands may write only in the workspace (network on) |
+| `local` | shell, file edits, MCP; no web search | like `full` without web search |
+| `offline` | file edits (`apply_patch`) and MCP; no shell, no web | shell in the sandbox without network, file edits, MCP |
+| `mcp` | MCP tools only (read-only, no shell, no file tools) | the same |
+| `none` | chat only, no MCP servers | the same |
+
+Only use `CODEX_SANDBOX=codex` if the container may create user namespaces (for example `security_opt: [seccomp=unconfined, apparmor=unconfined]`). Otherwise every command fails with a bwrap error. In that mode Codex also keeps `.git` read-only, so the agent can't commit.
+
+`usage` has `prompt_tokens`, `completion_tokens`, `cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens` and `total_tokens` for that job alone, even in a resumed thread. Codex doesn't report a price, so `cost_usd` and `charged_cents` are `null`: plan usage isn't billed per token, and API prices depend on the model.
+
+`CODEX_CONFIG` takes extra Codex settings, one `key=value` per line (TOML values, as with `codex -c`), for example a custom model provider. The Codex runtime makes the image about 450 MB larger.
+
 ## Model and workspace from the chat side
 
-- `model` picks the model, for example `composer-2.5` or `gpt-5` for Cursor, or `claude-opus-5-5` for Claude Code. If it is empty, `CURSOR_MODEL` or `CLAUDE_MODEL` is used.
+- `model` picks the model, for example `composer-2.5` or `gpt-5` for Cursor, `claude-opus-5-5` for Claude Code, or `gpt-5.5` for Codex. If it is empty, `CURSOR_MODEL`, `CLAUDE_MODEL` or `CODEX_MODEL` is used.
 - On `/v1`, `model@workspace` picks the workspace too, for example `composer-2.5@my-repo`. You can also send the header `X-Agent-Workspace`.
 - `X-Agent-Tools: offline` (on `/v1`) or `tools: "offline"` (MCP and jobs) narrows what the agent may use for that request.
 
@@ -209,7 +271,7 @@ curl -s localhost:8787/jobs -H "$H"                         # recent jobs
 curl -s localhost:8787/workspaces -H "$H"
 ```
 
-`POST /jobs` body: `task`, `engine` (`cursor` or `claude`), `workspace`, `session`, `model`, `effort`, `tools`, `mcp_servers`, `images` (base64 or data URI, at most 4), `instructions`, `wait` (0–600 s).
+`POST /jobs` body: `task`, `engine` (`cursor`, `claude` or `codex`), `workspace`, `session`, `model`, `effort`, `tools`, `mcp_servers`, `images` (base64 or data URI, at most 4), `instructions`, `wait` (0–600 s).
 
 Jobs and their events are stored in `/data/worker.sqlite` and survive restarts. A job that was running during a restart is marked failed.
 
@@ -281,13 +343,14 @@ The guard sees what the agent runs with the normal commands. It is a guardrail f
 - **Token:** Without `WORKER_TOKEN`, the worker answers only when it listens on loopback and the `Host` header is loopback. Otherwise every request is refused.
 - **`TOOL_PROFILE`** is the upper limit (`full` > `local` > `offline` > `mcp` > `none`). Requests can narrow it but never widen it.
 - **The agent can do whatever its tools allow inside the container,** including running shell commands, without asking. Treat the token like a shell login on the container. Don't mount anything you wouldn't hand to a shell.
+- **Codex's `auth.json`** in `/data/codex` holds ChatGPT tokens. Like the Claude token in `/data/claude`, it lives in the data volume and is readable by the agent's shell (same user). Don't give the worker a volume or token you wouldn't give that shell.
 - **MCP servers sent with a request** must be HTTP/SSE. Stdio servers (which start processes) and `${ENV}` substitution are only allowed in `/data/mcp.json`. Set `ALLOW_REQUEST_MCP=false` to accept only that file.
 - **SSH:** The guard listens only to callers inside the container. The worker's keys never leave the container, and requests cannot send SSH keys or config. See [SSH to your servers](#ssh-to-your-servers) for what approvals do and don't cover.
 - **Loops:** The worker adds `X-Agent-Worker-Depth` to every HTTP MCP server it hands to an agent. If an agent calls a worker back through MCP, that call is refused (`MAX_CALL_DEPTH`, default 1).
 
 ## Configuration
 
-See [.env.example](.env.example). The most important settings: `CURSOR_API_KEY`, `WORKER_TOKEN`, `CURSOR_MODEL`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `DEFAULT_ENGINE`, `TOOL_PROFILE`, `MAX_CONCURRENT_JOBS` (2), `JOB_TIMEOUT_SECONDS` (1800), `MCP_WAIT_SECONDS` (20), `WORKSPACE_DIR`, `GIT_REPO`, `SSH_KEY`, `SSH_KEYS_DIR`, `SSH_CONFIG`, `SSH_KNOWN_HOSTS`, `SSH_APPROVAL_HOSTS`, `SSH_APPROVAL_TIMEOUT`, `APPROVAL_TOOL`, `WORKER_INSTRUCTIONS`, `REWRITE_LOOPBACK_HOST`.
+See [.env.example](.env.example). The most important settings: `CURSOR_API_KEY`, `WORKER_TOKEN`, `CURSOR_MODEL`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `OPENAI_API_KEY`, `CODEX_MODEL`, `CODEX_AUTH_JSON`, `CODEX_SANDBOX`, `CODEX_CONFIG`, `DEFAULT_ENGINE`, `TOOL_PROFILE`, `MAX_CONCURRENT_JOBS` (2), `JOB_TIMEOUT_SECONDS` (1800), `MCP_WAIT_SECONDS` (20), `WORKSPACE_DIR`, `GIT_REPO`, `SSH_KEY`, `SSH_KEYS_DIR`, `SSH_CONFIG`, `SSH_KNOWN_HOSTS`, `SSH_APPROVAL_HOSTS`, `SSH_APPROVAL_TIMEOUT`, `APPROVAL_TOOL`, `WORKER_INSTRUCTIONS`, `REWRITE_LOOPBACK_HOST`.
 
 ## Development
 

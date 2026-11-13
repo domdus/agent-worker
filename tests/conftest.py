@@ -79,6 +79,16 @@ def make_settings(tmp: Path, **overrides) -> Settings:
     return base
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_home(tmp_path: Path, monkeypatch) -> None:
+    """The app's startup writes ~/.ssh and may clone GIT_REPO: never in the real home of whoever runs the tests."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    for name in ("SSH_KEY", "SSH_KEYS_DIR", "SSH_CONFIG", "SSH_KNOWN_HOSTS", "GIT_SSH_KEY", "GIT_REPO", "GIT_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     return make_settings(tmp_path)

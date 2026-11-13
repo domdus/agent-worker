@@ -124,7 +124,7 @@ def job_payload(job: Job, *, recent: int = 0, approval_tool: bool = False) -> di
     return out
 
 
-_ENGINE_LABELS = {"cursor": "cursor (Cursor SDK)", "claude": "claude (Claude Code)"}
+_ENGINE_LABELS = {"cursor": "cursor (Cursor SDK)", "claude": "claude (Claude Code)", "codex": "codex (OpenAI Codex)"}
 
 
 def _engines_note(engine) -> str:

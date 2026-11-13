@@ -283,7 +283,10 @@ class JobManager:
 
     def default_model(self, engine: str) -> str:
         model_for = getattr(self.engine, "model_for", None)
-        return (model_for(engine) if callable(model_for) else "") or self.settings.model
+        if not callable(model_for):
+            return self.settings.model
+        # Codex without CODEX_MODEL has no fixed default: the job shows the model once it has run.
+        return model_for(engine) or ("" if engine == "codex" else self.settings.model)
 
     def submit(self, req: JobRequest) -> Job:
         job_id = uuid.uuid4().hex[:16]
