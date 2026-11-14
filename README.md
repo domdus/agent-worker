@@ -125,6 +125,16 @@ There are two ways to connect it, and you can use both:
 
 Set `ENABLE_FORWARD_USER_INFO_HEADERS=true` on Open WebUI. It then sends the chat ID, so each chat keeps one Cursor agent. Without the chat ID, every message starts a new agent and gets the earlier turns pasted in. Also give Open WebUI a cheap **task model** (for titles and tags). Otherwise those small background requests also run on a Cursor agent.
 
+### Other OpenAI clients (LibreChat, Hermes as a provider, scripts)
+
+Any client that speaks OpenAI Chat Completions works with the same settings: base URL `http://agent-worker:8787/v1`, API key = `WORKER_TOKEN`, model as `/v1/models` lists it (`composer-2.5`, `claude-code/<model>`, `codex/<model>`, optionally `@workspace`). `cursor/<model>` picks Cursor explicitly, even when `DEFAULT_ENGINE` is another engine.
+
+- **Streaming:** with `"stream": true` the answer arrives live as `delta.content`. Claude Code streams token by token; Cursor and Codex send their text as it comes. A keepalive comment is sent while the agent works quietly, `stream_options.include_usage` adds a usage chunk at the end, and a failed job ends with an OpenAI `error` chunk before `[DONE]`.
+- **Agent steps** (tool calls, status) go to `delta.reasoning_content` by default, which Open WebUI and Hermes show as thinking. `OPENAI_STEPS=reasoning` uses the `reasoning` field instead, `none` sends only the answer. The header `X-Agent-Steps` sets it per request.
+- **One agent per chat:** the worker takes the chat's id from `X-OpenWebUI-Chat-Id`, `X-Session-Id`, `X-Agent-Session`, `X-Conversation-Id` or `X-Chat-Id`, or from `session_id`, `conversation_id` or `chat_id` in the body (also inside `metadata`). Placeholders such as `new` or an unfilled `{{...}}` template are ignored.
+- **Stop:** when the client closes the request (stop button, timeout), the job is cancelled, with and without streaming.
+- **Errors** come as OpenAI error objects (`{"error": {"message", "type", "code"}}`), so clients show the reason, for example a wrong API key.
+
 ### Home Assistant AI Workspace
 
 Add an MCP connection with URL `http://<worker-host>:8787/mcp` and the token as Bearer. Any agent (OpenAI, Claude, Ollama) can then hand work to Cursor with `agent_run`.

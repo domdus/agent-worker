@@ -99,6 +99,9 @@ class Settings:
     codex_sandbox: str = "container"
     # Extra `--config key=value` lines for Codex (TOML values), e.g. a custom model provider.
     codex_config: tuple[str, ...] = ()
+    # /v1 streams: where agent steps (tool calls, status) go. "reasoning_content" (Open WebUI, Hermes show
+    # it as thinking), "reasoning" (OpenRouter-style field) or "none" (only the answer). X-Agent-Steps overrides.
+    openai_steps: str = "reasoning_content"
 
     @property
     def claude_token_path(self) -> Path:
@@ -181,7 +184,19 @@ class Settings:
             codex_config=tuple(
                 line.strip() for line in os.environ.get("CODEX_CONFIG", "").splitlines() if "=" in line and line.strip()
             ),
+            openai_steps=steps_mode(os.environ.get("OPENAI_STEPS", "")) or "reasoning_content",
         )
+
+
+STEP_MODES = ("reasoning_content", "reasoning", "none")
+
+
+def steps_mode(value: str | None) -> str:
+    """A known OPENAI_STEPS / X-Agent-Steps value, else ""."""
+    want = (value or "").strip().lower()
+    if want in {"off", "false", "0", "no"}:
+        return "none"
+    return want if want in STEP_MODES else ""
 
 
 def narrow_profile(requested: str | None, ceiling: str) -> str:

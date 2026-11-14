@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
 _MAX_EVENTS = 5000
+# Past _MAX_EVENTS only these still count: dropping answer text, the outcome or an approval would break
+# a live chat stream. Text past the cap stays in memory only (the result is saved with the job anyway).
+_PAST_CAP = frozenset({"text", "result", "error", "approval"})
 
 
 class JobError(ValueError):
@@ -324,11 +327,13 @@ class JobManager:
     # ---- run ---------------------------------------------------------------------------------
 
     async def _emit(self, job: Job, event: dict[str, Any]) -> None:
-        if len(job.events) >= _MAX_EVENTS:
+        full = len(job.events) >= _MAX_EVENTS
+        if full and event.get("type") not in _PAST_CAP:
             return
         entry = {"seq": len(job.events) + 1, "at": _now(), **event}
         job.events.append(entry)
-        self.store.add_event(job.id, entry)
+        if not full or event.get("type") != "text":
+            self.store.add_event(job.id, entry)
         job.changed.set()
 
     def _settle(self, job: Job) -> None:
@@ -449,8 +454,9 @@ class JobManager:
                 break
         return job
 
-    async def follow(self, job: Job, after: int = 0) -> AsyncIterator[dict[str, Any]]:
-        """Events with seq > after, then new ones as they come, until the job ends."""
+    async def follow(self, job: Job, after: int = 0, ping: float = 15) -> AsyncIterator[dict[str, Any]]:
+        """Events with seq > after, then new ones as they come, until the job ends. A quiet spell of
+        `ping` seconds yields {"type": "ping"}, so a stream can send a keepalive."""
         seen = max(0, after)
         while True:
             while seen < len(job.events):
@@ -462,7 +468,7 @@ class JobManager:
             if seen < len(job.events) or job.done:
                 continue
             try:
-                await asyncio.wait_for(job.changed.wait(), 15)
+                await asyncio.wait_for(job.changed.wait(), ping)
             except asyncio.TimeoutError:
                 yield {"type": "ping"}
 

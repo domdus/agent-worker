@@ -1,15 +1,21 @@
-"""OpenAI-compatible chat endpoint, so Open WebUI (or any OpenAI client) can pick Cursor or Claude Code as a model.
+"""OpenAI-compatible chat endpoint, so Open WebUI, LibreChat, Hermes (or any OpenAI client) can pick Cursor,
+Claude Code or Codex as a model.
 
 Each request becomes a job. The newest user message is the task; earlier turns are pasted as context
-only when the agent is new. Agent steps stream as reasoning_content so Open WebUI shows them as thinking.
+only when the agent is new. With "stream": true the reply is an OpenAI chat.completion.chunk stream fed
+by the job's live events: answer text as delta.content, agent steps as delta.reasoning_content (Open WebUI
+and Hermes show it as thinking; OPENAI_STEPS / X-Agent-Steps change or drop it), a keepalive comment
+while the agent is quiet, a usage chunk if stream_options.include_usage, then [DONE]. A failed job ends
+with an OpenAI error chunk before [DONE]. A client that goes away cancels the job.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
-from typing import Any
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -18,12 +24,24 @@ from agent_worker import cursor_auth
 from agent_worker.images import parse_image
 from agent_worker.jobs import Job, JobError, JobManager, JobRequest
 from agent_worker.mcp_config import DEPTH_HEADER, parse_depth
+from agent_worker.settings import steps_mode
 from agent_worker.workspaces import WorkspaceError, resolve
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1")
 
+# A comment line after this many quiet seconds keeps proxies and clients from timing out the stream.
+KEEPALIVE_SECONDS = 15.0
+# Non-stream requests: how often to check whether the client is still there.
+DISCONNECT_POLL_SECONDS = 2.0
+
 _CONTEXT_CHARS = 60_000
-_SESSION_HEADERS = ("x-openwebui-chat-id", "x-session-id", "x-agent-session")
+# Where a chat's id may come from: Open WebUI (ENABLE_FORWARD_USER_INFO_HEADERS), LibreChat and others
+# (a header with the conversation id), or the request body.
+_SESSION_HEADERS = ("x-openwebui-chat-id", "x-session-id", "x-agent-session", "x-conversation-id", "x-chat-id")
+_SESSION_FIELDS = ("session_id", "conversation_id", "chat_id")
+_NOT_A_SESSION = {"new", "null", "none", "undefined", "false", "0"}
 _YES = {"approve", "approved", "yes", "y", "ok", "okay", "allow", "go", "go ahead", "continue", "ja", "jawohl"}
 _NO = {"deny", "denied", "no", "n", "stop", "cancel", "abort", "nein"}
 
@@ -63,6 +81,10 @@ def model_engine(raw: str) -> tuple[str, str, str]:
     from agent_worker.engines import split_engine
 
     model, workspace = split_model(raw)
+    name = str(raw or "").strip().lower()
+    if name.startswith("cursor/") or name.partition("@")[0] == "cursor":
+        # Named Cursor explicitly: not DEFAULT_ENGINE, even if that is another one.
+        return "cursor", model, workspace
     engine, model = split_engine(model)
     if engine and model in {"", "claude", "claude-code", "codex", "default"}:
         model = ""
@@ -119,15 +141,29 @@ def messages_to_request(messages: list[dict[str, Any]]) -> tuple[str, str, str, 
     return task, context, "\n\n".join(system), images
 
 
-def _chunk(cid: str, model: str, delta: dict[str, Any], finish: str | None = None) -> str:
-    body = {
-        "id": cid,
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-    }
-    return f"data: {json.dumps(body, ensure_ascii=False)}\n\n"
+# ---- OpenAI wire format ------------------------------------------------------------------------
+
+
+def error_body(message: str, kind: str = "invalid_request_error", code: str | None = None) -> dict[str, Any]:
+    """OpenAI's error object. "detail" stays for callers of the worker's own API."""
+    return {"error": {"message": message, "type": kind, "param": None, "code": code}, "detail": message}
+
+
+def _error_response(status: int, message: str, kind: str = "invalid_request_error", code: str | None = None):
+    return JSONResponse(error_body(message, kind, code), status_code=status)
+
+
+def session_of(request: Request, body: dict[str, Any]) -> str:
+    """The chat's id from a header or the body; empty for none. LibreChat sends "new" before a chat has an id,
+    and an unfilled header template stays "{{...}}": neither may tie unrelated chats to one agent."""
+    meta = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    found = [request.headers.get(h, "") for h in _SESSION_HEADERS]
+    found += [body.get(k) for k in _SESSION_FIELDS] + [meta.get(k) for k in _SESSION_FIELDS]
+    for value in found:
+        text = str(value or "").strip() if isinstance(value, (str, int)) else ""
+        if text and text.lower() not in _NOT_A_SESSION and "{{" not in text and "${" not in text:
+            return text[:200]
+    return ""
 
 
 def _usage(job: Job) -> dict[str, int]:
@@ -144,6 +180,116 @@ def _answer(job: Job) -> str:
         return job.result or "(cancelled)"
     detail = job.error or "The agent failed."
     return f"{job.result}\n\n**Agent worker error:** {detail}".strip()
+
+
+class ChunkWriter:
+    """chat.completion.chunk lines for one reply: the same id and created on every chunk, `usage: null` on
+    each one when the client asked for a usage chunk (as OpenAI does)."""
+
+    def __init__(self, cid: str, model: str, include_usage: bool) -> None:
+        self.cid = cid
+        self.model = model
+        self.include_usage = include_usage
+        self.created = int(time.time())
+
+    def _line(self, body: dict[str, Any]) -> str:
+        return f"data: {json.dumps(body, ensure_ascii=False)}\n\n"
+
+    def chunk(self, delta: dict[str, Any], finish: str | None = None) -> str:
+        body: dict[str, Any] = {
+            "id": self.cid,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+        if self.include_usage:
+            body["usage"] = None
+        return self._line(body)
+
+    def usage(self, usage: dict[str, int]) -> str:
+        return self._line({"id": self.cid, "object": "chat.completion.chunk", "created": self.created,
+                           "model": self.model, "choices": [], "usage": usage})
+
+    def error(self, message: str, kind: str = "agent_error", code: str | None = None) -> str:
+        # No "choices": Open WebUI shows it as the reply's error; the OpenAI SDKs raise APIError on it.
+        return self._line({"error": {"message": message, "type": kind, "param": None, "code": code}})
+
+    @staticmethod
+    def keepalive() -> str:
+        return ": keepalive\n\n"
+
+    @staticmethod
+    def done() -> str:
+        return "data: [DONE]\n\n"
+
+    def finish(self, usage: dict[str, int] | None) -> list[str]:
+        lines = [self.chunk({}, "stop")]
+        if self.include_usage:
+            lines.append(self.usage(usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}))
+        lines.append(self.done())
+        return lines
+
+
+async def sse_reply(
+    manager: JobManager,
+    job: Job,
+    out: ChunkWriter,
+    *,
+    after: int = 0,
+    steps: str = "reasoning_content",
+    disconnected: Callable[[], Awaitable[bool]] | None = None,
+) -> AsyncIterator[str]:
+    """The job's live events as an OpenAI chat stream. If the stream ends before the job does (the client
+    went away, or pressed stop), the job is cancelled."""
+    finished = False
+    try:
+        yield out.chunk({"role": "assistant", "content": ""})
+        streamed = False
+        last_step = ""
+        async for event in manager.follow(job, after, ping=KEEPALIVE_SECONDS):
+            if disconnected is not None and await disconnected():
+                return
+            kind = event.get("type")
+            if kind == "approval":
+                # End this reply with the question; the job waits. The user's next message answers it.
+                yield out.chunk({"content": approval_prompt(job)})
+                for line in out.finish(_usage(job)):
+                    yield line
+                finished = True
+                return
+            if kind == "text":
+                delta = str(event.get("delta") or "")
+                if delta:
+                    streamed = True
+                    yield out.chunk({"content": delta})
+            elif kind in {"tool", "status"} and steps != "none":
+                line = str(event.get("text") or "").strip()
+                if line and line != last_step:
+                    last_step = line
+                    yield out.chunk({steps: line + "\n"})
+            elif kind == "ping":
+                yield out.keepalive()
+        if not job.done:
+            return
+        if job.status == "succeeded":
+            if not streamed and job.result:
+                yield out.chunk({"content": job.result})
+            for line in out.finish(_usage(job)):
+                yield line
+        else:
+            if not streamed and job.result:
+                yield out.chunk({"content": job.result})
+            if job.status == "cancelled":
+                yield out.error(job.error or "The job was cancelled.", "agent_cancelled", "cancelled")
+            else:
+                yield out.error(job.error or "The agent failed.", "agent_error", job.status)
+            yield out.done()
+        finished = True
+    finally:
+        if not finished and not job.done:
+            logger.info("job %s: the chat stream ended early, cancelling", job.id)
+            manager.cancel(job.id)
 
 
 @router.get("/models")
@@ -167,14 +313,17 @@ async def chat_completions(request: Request):
     manager: JobManager = request.app.state.jobs
     try:
         body = await request.json()
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Body is not JSON.") from None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error_response(400, "Body is not JSON.")
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
-        raise HTTPException(status_code=400, detail="messages is required.")
+        return _error_response(400, "messages is required.", code="missing_messages")
     engine, model, workspace = model_engine(str(body.get("model") or ""))
     workspace = request.headers.get("x-agent-workspace", "").strip() or workspace
-    session = next((request.headers.get(h, "").strip() for h in _SESSION_HEADERS if request.headers.get(h)), "")
-    task, context, instructions, images = messages_to_request(body["messages"])
+    session = session_of(request, body)
+    try:
+        task, context, instructions, images = messages_to_request(body["messages"])
+    except HTTPException as exc:
+        return _error_response(exc.status_code, str(exc.detail))
     try:
         resolved_ws = resolve(manager.settings, workspace, create=False)[0]
     except WorkspaceError:
@@ -183,7 +332,7 @@ async def chat_completions(request: Request):
     if paused is not None:
         answer = decision_word(task)
         if answer is None:
-            return _reply(body, paused, approval_prompt(paused).strip(), request)
+            return _reply(body, paused, approval_prompt(paused).strip())
         manager.decide(paused.id, answer, "" if answer else "denied in chat")
         await asyncio.sleep(0)
         return await _respond(request, manager, body, paused, after=len(paused.events))
@@ -205,27 +354,62 @@ async def chat_completions(request: Request):
             )
         )
     except JobError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc)) from None
+        return _error_response(exc.status, str(exc), "invalid_request_error" if exc.status < 500 else "server_error")
     return await _respond(request, manager, body, job)
 
 
-def _reply(body: dict, job: Job, text: str, request: Request):
+def _include_usage(body: dict) -> bool:
+    options = body.get("stream_options")
+    return bool(options.get("include_usage")) if isinstance(options, dict) else False
+
+
+def _sse_response(lines: AsyncIterator[str]) -> StreamingResponse:
+    return StreamingResponse(
+        lines,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+def _completion(cid: str, shown: str, text: str, usage: dict[str, int], extra: dict | None = None) -> JSONResponse:
+    return JSONResponse({
+        "id": cid, "object": "chat.completion", "created": int(time.time()), "model": shown,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "usage": usage,
+        **(extra or {}),
+    })
+
+
+def _reply(body: dict, job: Job, text: str):
     """A fixed answer (no new job), in the shape the caller asked for."""
     cid = f"chatcmpl-{job.id}"
     shown = str(body.get("model") or job.model)
     if not body.get("stream"):
-        return JSONResponse({
-            "id": cid, "object": "chat.completion", "created": int(time.time()), "model": shown,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        })
+        return _completion(cid, shown, text, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    out = ChunkWriter(cid, shown, _include_usage(body))
 
-    async def stream():
-        yield _chunk(cid, shown, {"role": "assistant", "content": text})
-        yield _chunk(cid, shown, {}, "stop")
-        yield "data: [DONE]\n\n"
+    async def lines():
+        yield out.chunk({"role": "assistant", "content": text})
+        for line in out.finish(None):
+            yield line
 
-    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    return _sse_response(lines())
+
+
+async def _wait_or_leave(request: Request, manager: JobManager, job: Job) -> bool:
+    """Non-stream: wait for the job (or its approval question). False if the client hung up first; the job
+    is cancelled then, as the stop button does in a stream."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + manager.settings.job_timeout + 30
+    while True:
+        left = deadline - loop.time()
+        await manager.wait(job, min(DISCONNECT_POLL_SECONDS, max(left, 0)), stop_on_approval=True)
+        if job.done or job.status == "needs_approval" or left <= 0:
+            return True
+        if await request.is_disconnected():
+            logger.info("job %s: the client hung up, cancelling", job.id)
+            manager.cancel(job.id)
+            return False
 
 
 async def _respond(request: Request, manager: JobManager, body: dict, job: Job, after: int = 0):
@@ -233,67 +417,13 @@ async def _respond(request: Request, manager: JobManager, body: dict, job: Job, 
     shown = str(body.get("model") or job.model)
 
     if not body.get("stream"):
-        await manager.wait(job, manager.settings.job_timeout + 30, stop_on_approval=True)
+        if not await _wait_or_leave(request, manager, job):
+            return _error_response(499, "The client closed the request; the job was cancelled.", "agent_cancelled")
         if job.status == "needs_approval":
-            return _reply(body, job, (job.result or "") + approval_prompt(job), request)
-        return JSONResponse(
-            {
-                "id": cid,
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": shown,
-                "choices": [
-                    {"index": 0, "message": {"role": "assistant", "content": _answer(job)}, "finish_reason": "stop"}
-                ],
-                "usage": _usage(job),
-                "agent_worker": {"job_id": job.id, "status": job.status, "changes": job.changes},
-            }
-        )
+            return _reply(body, job, (job.result or "") + approval_prompt(job))
+        return _completion(cid, shown, _answer(job), _usage(job),
+                           {"agent_worker": {"job_id": job.id, "status": job.status, "changes": job.changes}})
 
-    include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
-
-    async def stream():
-        streamed_text = False
-        finished = False
-        try:
-            yield _chunk(cid, shown, {"role": "assistant", "content": ""})
-            async for event in manager.follow(job, after):
-                if await request.is_disconnected():
-                    break
-                kind = event.get("type")
-                if kind == "approval":
-                    # End this reply with the question; the job waits. The user's next message answers it.
-                    yield _chunk(cid, shown, {"content": approval_prompt(job)})
-                    yield _chunk(cid, shown, {}, "stop")
-                    yield "data: [DONE]\n\n"
-                    finished = True
-                    return
-                if kind == "text":
-                    streamed_text = True
-                    yield _chunk(cid, shown, {"content": str(event.get("delta") or "")})
-                elif kind in {"tool", "status"}:
-                    line = str(event.get("text") or "").strip()
-                    if line:
-                        yield _chunk(cid, shown, {"reasoning_content": line + "\n"})
-                elif kind == "ping":
-                    yield ": ping\n\n"
-            if job.done:
-                if not streamed_text and job.status == "succeeded" and job.result:
-                    yield _chunk(cid, shown, {"content": job.result})
-                elif job.status != "succeeded":
-                    yield _chunk(cid, shown, {"content": "\n\n" + _answer(job)})
-                yield _chunk(cid, shown, {}, "stop")
-                if include_usage:
-                    usage = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                             "model": shown, "choices": [], "usage": _usage(job)}
-                    yield f"data: {json.dumps(usage)}\n\n"
-                yield "data: [DONE]\n\n"
-                finished = True
-        finally:
-            # The user pressed stop in the chat (or the client went away): stop the agent too.
-            if not finished and not job.done:
-                manager.cancel(job.id)
-
-    return StreamingResponse(
-        stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-    )
+    steps = steps_mode(request.headers.get("x-agent-steps")) or manager.settings.openai_steps
+    out = ChunkWriter(cid, shown, _include_usage(body))
+    return _sse_response(sse_reply(manager, job, out, after=after, steps=steps, disconnected=request.is_disconnected))

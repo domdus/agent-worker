@@ -187,7 +187,9 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             return JSONResponse({"detail": "Without WORKER_TOKEN the worker only answers on 127.0.0.1."}, status_code=403)
         if request.url.path not in _OPEN_PATHS and not _token_ok(settings, request.headers.get("authorization", "")):
             detail = "Bearer token is missing or wrong." if settings.token else "Set WORKER_TOKEN on the worker."
-            return JSONResponse({"detail": detail}, status_code=401, headers={"WWW-Authenticate": "Bearer"})
+            # "error" too, so OpenAI clients (Open WebUI, LibreChat, Hermes) show the reason.
+            body = openai_compat.error_body(detail, "authentication_error", "invalid_api_key")
+            return JSONResponse(body, status_code=401, headers={"WWW-Authenticate": "Bearer"})
         return await call_next(request)
 
     def _engine_ready(name: str) -> bool:

@@ -244,6 +244,40 @@ class _Turn:
         self.parts: list[str] = []
         self.result: Any = None
         self.api_error = ""
+        # Messages whose text already went out as live deltas (partial messages); "" = id unknown.
+        self.streamed: set[str] = set()
+        self._message = ""
+
+    def partial(self, event: Any) -> list[dict[str, Any]]:
+        """A raw Anthropic stream event (include_partial_messages) -> live text deltas."""
+        if not isinstance(event, dict):
+            return []
+        kind = event.get("type")
+        if kind == "message_start":
+            self._message = str((event.get("message") or {}).get("id") or "")
+            return []
+        if kind == "content_block_start" and (event.get("content_block") or {}).get("type") == "text":
+            # A new text block after earlier text (often after a tool call): keep the paragraphs apart.
+            sofar = "".join(self.parts)
+            if sofar.strip() and not sofar.endswith("\n"):
+                self.parts.append("\n\n")
+                return [{"type": "text", "delta": "\n\n"}]
+            return []
+        if kind == "content_block_delta":
+            delta = event.get("delta") or {}
+            text = str(delta.get("text") or "") if delta.get("type") == "text_delta" else ""
+            if text:
+                self.streamed.add(self._message)
+                self.parts.append(text)
+                return [{"type": "text", "delta": text}]
+        return []
+
+    def already_streamed(self, message: Any) -> bool:
+        """True if this whole assistant message's text was sent as deltas before."""
+        ident = str(getattr(message, "message_id", "") or "")
+        if ident:
+            return ident in self.streamed
+        return bool(self.streamed)
 
 
 class ClaudeEngine:
@@ -273,7 +307,7 @@ class ClaudeEngine:
         return (redact(str(exc), [cred]).strip() or type(exc).__name__)[:400]
 
     async def _turn(self, spec: RunSpec, cred: str, resume: str | None, emit: Emit) -> _Turn:
-        from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, query
+        from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, StreamEvent, query
 
         message = compose_message(spec, not resume, self.settings.instructions)
         content = user_content(message, spec.images)
@@ -288,6 +322,8 @@ class ClaudeEngine:
             "resume": resume,
             "mcp_servers": servers,
             "stderr": lambda line: logger.debug("claude cli: %s", redact(line, [cred])),
+            # Token-level text as it is written (StreamEvent), not only whole messages at the end of each.
+            "include_partial_messages": True,
             **tool_policy(spec.profile, servers),
         }
         level = _EFFORT.get((spec.effort or "").strip())
@@ -308,7 +344,15 @@ class ClaudeEngine:
                 if isinstance(item, ResultMessage):
                     turn.result = item
                     continue
-                for event in map_message(item):
+                if isinstance(item, StreamEvent):
+                    for event in turn.partial(item.event):
+                        await emit(event)
+                    continue
+                events = map_message(item)
+                if isinstance(item, AssistantMessage) and turn.already_streamed(item):
+                    # The text went out as deltas already; keep only the tool and thinking steps.
+                    events = [e for e in events if e.get("type") != "text"]
+                for event in events:
                     if event.get("type") == "text":
                         turn.parts.append(str(event.get("delta") or ""))
                     await emit(event)

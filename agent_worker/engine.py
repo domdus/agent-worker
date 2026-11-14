@@ -7,7 +7,6 @@ no transcript handoff from HA, no small-talk tool switch, no Change History call
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os

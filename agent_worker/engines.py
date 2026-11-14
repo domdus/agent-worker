@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 # How the engines show up in /v1 model ids: "claude-code/claude-sonnet-5-5", "codex/gpt-5.5". Cursor ids
 # stay bare, because Cursor itself offers Claude and GPT models under names such as "claude-4.5-sonnet".
 MODEL_PREFIX = {"claude": "claude-code/", "codex": "codex/"}
+# Also accepted on input (never listed): "claude/claude-opus-5-5" is the same as "claude-code/claude-opus-5-5".
+_ALIASES = {"claude/": "claude"}
 
 
 class EngineRouter:
@@ -75,7 +77,8 @@ def split_engine(model: str) -> tuple[str, str]:
     """'claude-code/claude-opus-5-5' -> ('claude', 'claude-opus-5-5'), 'codex/gpt-5.5' -> ('codex', 'gpt-5.5');
     anything else -> ('', model)."""
     name = (model or "").strip()
-    for engine, prefix in MODEL_PREFIX.items():
+    prefixes = [(prefix, engine) for engine, prefix in MODEL_PREFIX.items()] + list(_ALIASES.items())
+    for prefix, engine in prefixes:
         if name == prefix.rstrip("/"):
             # The bare prefix ("claude-code") means that engine with its default model.
             return engine, ""
