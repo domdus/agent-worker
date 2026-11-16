@@ -15,7 +15,9 @@ name: agent-worker
 
 services:
   agent-worker:
-    image: ghcr.io/domdus/agent-worker:latest
+    # Pinned release; CI publishes it on the v0.5.0 tag. `build: .` builds the same tag from this
+    # checkout only when you ask for it (`docker compose build`); deploy with `up -d --no-build`.
+    image: ghcr.io/domdus/agent-worker:0.5.0
     build: .
     container_name: agent-worker
     env_file: .env

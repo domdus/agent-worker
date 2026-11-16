@@ -69,7 +69,9 @@ def test_auth_overview_needs_the_token_and_lists_every_engine(worker) -> None:
         "env_override": False,
         "login": None,
         "method": "api_key",
+        "default_model": "composer-2.5",
     }
+    assert claude["default_model"] == "claude-sonnet-5-5" and body["engines"]["codex"]["default_model"] is None
     assert claude["credential"] == "none" and claude["login"] is None and claude["method"] == "oauth_code"
     assert body["engines"]["codex"]["method"] == "device_code" and body["engines"]["codex"]["ready"] is False
 

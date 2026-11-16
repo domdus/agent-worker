@@ -107,7 +107,7 @@ def test_mcp_tool_takes_an_engine(settings) -> None:
         return job_payload(job)
 
     payload = asyncio.run(run())
-    assert payload["engine"] == "claude" and payload["status"] == "succeeded"
+    assert payload["engine"] == "claude" and payload["status"] == "completed"
 
 
 def test_health_reports_claude(settings, monkeypatch) -> None:
@@ -152,7 +152,7 @@ def test_codex_jobs_and_v1(settings) -> None:
         assert job["engine"] == "codex" and job["model"] == ""
         router.engines["codex"].gate.set()
         done = client.get(f"/jobs/{job['id']}?wait=5").json()
-        assert done["status"] == "succeeded" and done["model"] == "composer-2.5"
+        assert done["status"] == "completed" and done["model"] == "composer-2.5"
         override = client.post("/jobs", json={"task": "hi", "engine": "codex", "model": "gpt-5.5", "wait": 5}).json()
         assert override["model"] == "gpt-5.5" and router.engines["codex"].specs[-1].model == "gpt-5.5"
         ids = [row["id"] for row in client.get("/v1/models").json()["data"]]

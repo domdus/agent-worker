@@ -22,6 +22,7 @@ from typing import Any
 
 from agent_worker.claude_login import load_token
 from agent_worker.engine import (
+    JOB_ENV,
     WORKSPACE_ENV,
     AgentIdStore,
     Emit,
@@ -107,7 +108,7 @@ def is_plan_token(value: str) -> bool:
     return (value or "").strip().startswith("sk-ant-oat")
 
 
-def subprocess_env(settings: Settings, cred: str, workspace: str) -> dict[str, str]:
+def subprocess_env(settings: Settings, cred: str, workspace: str, job_id: str = "") -> dict[str, str]:
     """Merged onto the Claude Code subprocess, not the worker's own environment."""
     settings.claude_config_dir.mkdir(parents=True, exist_ok=True)
     plan = is_plan_token(cred)
@@ -120,6 +121,8 @@ def subprocess_env(settings: Settings, cred: str, workspace: str) -> dict[str, s
         "DISABLE_AUTOUPDATER": "1",
         # The agent's shell inherits this: the ssh guard knows which job a command belongs to.
         WORKSPACE_ENV: workspace,
+        # How a stopped job's leftover processes are found (proctree).
+        JOB_ENV: job_id,
     }
 
 
@@ -318,7 +321,7 @@ class ClaudeEngine:
             "setting_sources": [],
             "strict_mcp_config": True,
             "model": resolve_model(self.settings, spec.model),
-            "env": subprocess_env(self.settings, cred, spec.workspace),
+            "env": subprocess_env(self.settings, cred, spec.workspace, spec.job_id),
             "resume": resume,
             "mcp_servers": servers,
             "stderr": lambda line: logger.debug("claude cli: %s", redact(line, [cred])),

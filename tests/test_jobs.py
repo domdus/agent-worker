@@ -18,7 +18,7 @@ async def test_job_runs_and_records_events(settings, engine):
     manager = manager_for(settings, engine)
     job = manager.submit(JobRequest(task="fix the bug"))
     await manager.wait(job, 5)
-    assert job.status == "succeeded"
+    assert job.status == "completed"
     assert job.result == "Done: fix the bug"
     assert job.changes["files"] == [" M README.md"]
     kinds = [e["type"] for e in job.events]
@@ -63,7 +63,7 @@ async def test_same_workspace_jobs_run_one_at_a_time(settings, engine):
     engine.gate.set()
     for job in (first, second, other, chat_only):
         await manager.wait(job, 5)
-        assert job.status == "succeeded"
+        assert job.status == "completed"
 
 
 async def test_cancel_running_and_queued(settings, engine):
@@ -94,7 +94,7 @@ async def test_timeout_fails_the_job(settings, engine):
     job = manager.submit(JobRequest(task="a"))
     await manager.wait(job, 5)
     assert job.status == "failed"
-    assert "JOB_TIMEOUT_SECONDS" in job.error
+    assert "JOB_MAX_RUNTIME_SECONDS" in job.error
 
 
 async def test_engine_error_fails_the_job(settings, engine):
@@ -127,11 +127,11 @@ async def test_restart_restores_jobs_and_fails_running_ones(settings, engine):
     engine.gate = asyncio.Event()
     stuck = manager.submit(JobRequest(task="b"))
     await asyncio.sleep(0.05)
-    assert stuck.status == "running"
+    assert stuck.status == "working"
 
     # A second process reading the same database is what a restart looks like.
     again = manager_for(settings, engine)
-    assert again.get(done.id).status == "succeeded"
+    assert again.get(done.id).status == "completed"
     assert again.get(done.id).events
     restored = again.get(stuck.id)
     assert restored.status == "failed" and "restarted" in restored.error

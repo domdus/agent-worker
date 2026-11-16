@@ -52,7 +52,7 @@ def test_job_lifecycle(client):
     created = client.post("/jobs", json={"task": "add tests", "wait": 5})
     assert created.status_code == 200
     job = created.json()
-    assert job["status"] == "succeeded" and job["result"] == "Done: add tests"
+    assert job["status"] == "completed" and job["result"] == "Done: add tests"
     assert client.get(f"/jobs/{job['id']}").json()["changes"]["files"] == [" M README.md"]
     assert client.get("/jobs").json()["jobs"][0]["id"] == job["id"]
     events = client.get(f"/jobs/{job['id']}/events", params={"follow": "false"}).json()["events"]
@@ -64,7 +64,7 @@ def test_job_events_sse(client):
     with client.stream("GET", f"/jobs/{job['id']}/events") as resp:
         text = "".join(resp.iter_text())
     assert "event: tool" in text and "event: end" in text
-    assert '"status": "succeeded"' in text
+    assert '"status": "completed"' in text
 
 
 def test_bad_requests(client):

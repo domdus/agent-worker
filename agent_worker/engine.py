@@ -38,6 +38,9 @@ BASE_INSTRUCTIONS = (
 
 Emit = Callable[[dict], Awaitable[None]]
 WORKSPACE_ENV = "AGENT_WORKER_WORKSPACE"
+# Set on engine subprocesses that belong to one job (Claude Code, Codex): a stopped job's leftovers are
+# found by it. The Cursor bridge serves a whole workspace and only carries WORKSPACE_ENV.
+JOB_ENV = "AGENT_WORKER_JOB"
 
 
 class EngineError(RuntimeError):
@@ -198,6 +201,22 @@ class CursorEngine:
     def forget(self, workspace: str, session: str) -> None:
         self._agents.pop((workspace, session), None)
         self._set_agent_id(workspace, session, "")
+
+    async def kill(self, spec: RunSpec) -> None:
+        """A stopped job: take down the workspace's bridge and everything it started (the agent's
+        shells too). The next job in the workspace starts a fresh bridge; sessions resume by agent id."""
+        from agent_worker import proctree
+
+        async with self._client_lock:
+            client = self._clients.pop(spec.workspace, None)
+        for key in [key for key in self._agents if key[0] == spec.workspace]:
+            self._agents.pop(key, None)
+        await proctree.kill_tagged(WORKSPACE_ENV, spec.workspace, unless=JOB_ENV)
+        if client is not None:
+            try:
+                await asyncio.wait_for(client.aclose(), 5)
+            except Exception:
+                logger.debug("cursor bridge close after kill failed", exc_info=True)
 
     async def run(self, spec: RunSpec, emit: Emit) -> Outcome:
         if not self.api_key:

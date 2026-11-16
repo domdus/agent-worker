@@ -54,6 +54,12 @@ class EngineRouter:
     async def run(self, spec: RunSpec, emit: Emit) -> Outcome:
         return await self.engines[spec.engine].run(spec, emit)
 
+    async def kill(self, spec: RunSpec) -> None:
+        """Engine-side cleanup after a stopped job (only Cursor has one: its bridge serves a workspace)."""
+        kill = getattr(self.engines.get(spec.engine), "kill", None)
+        if callable(kill):
+            await kill(spec)
+
     async def models(self) -> list[dict[str, str]]:
         """Every engine's models; ids carry the engine prefix where one is needed."""
         rows: list[dict[str, str]] = []
