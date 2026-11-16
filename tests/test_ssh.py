@@ -112,7 +112,7 @@ async def _running(manager, engine, **request):
     engine.gate = asyncio.Event()
     job = manager.submit(JobRequest(task="deploy", **request))
     await asyncio.sleep(0.05)
-    assert job.status == "running"
+    assert job.status == "working"
     return job
 
 
@@ -129,19 +129,19 @@ async def test_approval_host_waits_for_a_decision(settings, engine):
     job = await _running(manager, engine)
     call = asyncio.create_task(manager.remote_call("default", "ssh", "prod-db", "10.0.9.9", "root", "reboot"))
     await asyncio.sleep(0.02)
-    assert job.status == "needs_approval"
+    assert job.status == "input_required"
     assert job.pending_approval["command"] == "reboot"
     assert job.summary()["approval"]["host"] == "prod-db"
     manager.decide(job.id, True, "go")
     assert await call == (True, "")
-    assert job.status == "running" and "prod-db" in job.approved_hosts
+    assert job.status == "working" and "prod-db" in job.approved_hosts
     # Approved once per job and host.
     assert await manager.remote_call("default", "ssh", "prod-db", "", "root", "uptime") == (True, "")
     with pytest.raises(JobError):
         manager.decide(job.id, True)
     engine.gate.set()
     await manager.wait(job, 5)
-    assert job.status == "succeeded"
+    assert job.status == "completed"
 
 
 async def test_hostname_pattern_and_denial(settings, engine):
@@ -207,13 +207,13 @@ async def test_guard_endpoint_and_approve_api(settings, engine):
         call = asyncio.create_task(http.post("/internal/remote", json=body))
         await asyncio.sleep(0.05)
         state = (await http.get(f"/jobs/{job['id']}")).json()
-        assert state["status"] == "needs_approval" and state["approval"]["command"] == "rm -rf /tmp/x"
+        assert state["status"] == "input_required" and state["approval"]["command"] == "rm -rf /tmp/x"
         assert (await http.post(f"/jobs/{job['id']}/approve", json={"approve": True})).status_code == 200
         assert (await call).json() == {"allow": True, "reason": ""}
         assert (await http.post(f"/jobs/{job['id']}/approve", json={"approve": True})).status_code == 409
         engine.gate.set()
         done = (await http.get(f"/jobs/{job['id']}", params={"wait": 5})).json()
-        assert done["status"] == "succeeded" and done["approved_hosts"] == ["prod"]
+        assert done["status"] == "completed" and done["approved_hosts"] == ["prod"]
 
 
 # ---- MCP: elicitation asks the human -----------------------------------------------------------
@@ -238,7 +238,7 @@ async def test_mcp_elicitation_asks_the_user(settings, engine):
 
     async with Client(build_mcp(manager), elicitation_callback=elicit) as client:
         data = (await client.call_tool("agent_run", {"task": "reboot prod"})).structured_content
-    assert data["status"] == "succeeded"
+    assert data["status"] == "completed"
     assert results == [(True, "")]
     assert "reboot" in asked[0] and "root@prod" in asked[0]
 
@@ -251,10 +251,10 @@ async def test_mcp_without_elicitation_reports_needs_approval(settings, engine):
         names = {t.name for t in (await client.list_tools()).tools}
         assert "agent_approve" in names
         first = (await client.call_tool("agent_run", {"task": "reboot prod"})).structured_content
-        assert first["status"] == "needs_approval" and first["approval"]["host"] == "prod"
+        assert first["status"] == "input_required" and first["approval"]["host"] == "prod"
         assert "Do not decide yourself" in first["hint"]
         done = (await client.call_tool("agent_approve", {"job_id": first["job_id"], "approve": False})).structured_content
-    assert done["status"] == "succeeded"
+    assert done["status"] == "completed"
     assert results[0][0] is False
 
 
@@ -287,13 +287,13 @@ async def test_openai_chat_pauses_and_continues(settings, engine):
         first = await http.post("/v1/chat/completions", json=ask, headers=headers)
         assert "Approval needed" in content(first) and "reboot" in content(first)
         job = manager.list(1)[0]
-        assert job.status == "needs_approval"  # not cancelled when the reply ended
+        assert job.status == "input_required"  # not cancelled when the reply ended
         other = {**ask, "messages": [*ask["messages"], {"role": "user", "content": "what?"}]}
         assert "Approval needed" in content(await http.post("/v1/chat/completions", json=other, headers=headers))
         yes = {**ask, "messages": [*ask["messages"], {"role": "user", "content": "Approve"}]}
         second = await http.post("/v1/chat/completions", json=yes, headers=headers)
     assert content(second) == "Done: reboot prod"
-    assert results == [(True, "")] and job.status == "succeeded"
+    assert results == [(True, "")] and job.status == "completed"
 
 
 # ---- the real guard script ---------------------------------------------------------------------

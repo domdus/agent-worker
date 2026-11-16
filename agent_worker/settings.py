@@ -50,6 +50,10 @@ def _codex_sandbox(raw: str) -> str:
     return value if value in CODEX_SANDBOXES else "container"
 
 
+def _status_names(raw: str) -> str:
+    return "legacy" if (raw or "").strip().lower() == "legacy" else "mcp"
+
+
 def _profile(raw: str) -> str:
     value = (raw or "").strip().lower()
     return value if value in TOOL_PROFILES else "full"
@@ -82,6 +86,16 @@ class Settings:
     # Upper bound for every MCP wait (agent_run, agent_job, ...), kept below the usual client tool
     # timeouts (often 30 s), so an answer with the job_id arrives before the client gives up.
     mcp_max_wait: int = 25
+    # MCP cancellation: a tools/call agent_run that the client cancels (notifications/cancelled) or abandons
+    # by disconnecting cancels the job it started, unless the job was started with background=true.
+    mcp_cancel_on_cancelled: bool = True
+    mcp_cancel_on_disconnect: bool = True
+    # What `status` reports: "mcp" (MCP Task vocabulary: queued, working, input_required, completed, failed,
+    # cancelled) or "legacy" (names before 0.5.0: queued, running, needs_approval, succeeded, failed,
+    # cancelled). legacy_status always carries the old name, filters accept both.
+    job_status_names: str = "mcp"
+    # MCP Tasks view of a job (agent_job "task", GET /jobs/{id}): suggested poll interval and retention (ms).
+    task_poll_interval_ms: int = 5000
     max_call_depth: int = 1
     keep_jobs: int = 200
     instructions: str = ""
@@ -178,6 +192,10 @@ class Settings:
             approval_timeout=_int("APPROVAL_TIMEOUT_SECONDS", _int("SSH_APPROVAL_TIMEOUT", 1800, 10), 10),
             mcp_wait_seconds=_int("MCP_WAIT_SECONDS", 20, 0),
             mcp_max_wait=_int("MCP_MAX_WAIT_SECONDS", 25, 1),
+            mcp_cancel_on_cancelled=_bool("MCP_CANCEL_ON_CANCELLED", True),
+            mcp_cancel_on_disconnect=_bool("MCP_CANCEL_ON_DISCONNECT", True),
+            job_status_names=_status_names(os.environ.get("JOB_STATUS_NAMES", "")),
+            task_poll_interval_ms=_int("TASK_POLL_INTERVAL_MS", 5000, 500),
             max_call_depth=_int("MAX_CALL_DEPTH", 1, 1),
             keep_jobs=_int("KEEP_JOBS", 200, 10),
             instructions=os.environ.get("WORKER_INSTRUCTIONS", "").strip(),

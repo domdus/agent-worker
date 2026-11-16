@@ -27,7 +27,7 @@ async def test_agent_run_returns_the_result(settings, engine):
     async with Client(build_mcp(_manager(settings, engine))) as client:
         result = await client.call_tool("agent_run", {"task": "write docs", "workspace": "docs"})
     data = _data(result)
-    assert data["status"] == "succeeded"
+    assert data["status"] == "completed"
     assert data["result"] == "Done: write docs"
     assert data["workspace"] == "docs"
     assert data["changes"]["files"] == [" M README.md"]
@@ -38,10 +38,10 @@ async def test_long_job_returns_a_job_id_then_finishes(settings, engine):
     manager = _manager(replace(settings, mcp_wait_seconds=0), engine)
     async with Client(build_mcp(manager)) as client:
         first = _data(await client.call_tool("agent_run", {"task": "slow"}))
-        assert first["status"] in {"queued", "running"} and "hint" in first
+        assert first["status"] in {"queued", "working"} and "hint" in first
         engine.gate.set()
         done = _data(await client.call_tool("agent_job", {"job_id": first["job_id"], "wait_seconds": 5}))
-    assert done["status"] == "succeeded"
+    assert done["status"] == "completed"
 
 
 async def test_cancel_and_unknown_job(settings, engine):
@@ -72,5 +72,5 @@ async def test_agent_run_names_the_engines_and_takes_one(settings):
         assert "engine" in tools["agent_run"].input_schema["properties"]
         result = await client.call_tool("agent_run", {"task": "hi", "engine": "claude", "wait_seconds": 5})
     data = _data(result)
-    assert data["engine"] == "claude" and data["status"] == "succeeded"
+    assert data["engine"] == "claude" and data["status"] == "completed"
     assert router.engines["claude"].specs and not router.engines["cursor"].specs

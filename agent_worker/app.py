@@ -87,6 +87,8 @@ class JobBody(BaseModel):
     images: list[Any] = Field(default_factory=list, max_length=4)
     instructions: str = Field(default="", max_length=60_000)
     wait: int = Field(default=0, ge=0, le=600)
+    # Opaque id of the client's conversation (no secrets); filter and cancel by it.
+    conversation_id: str = Field(default="", max_length=128)
 
 
 def _sse(payload: dict[str, Any]) -> str:
@@ -497,6 +499,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
                     instructions=body.instructions,
                     depth=parse_depth(request.headers.get(DEPTH_HEADER)),
                     origin="api",
+                    conversation_id=body.conversation_id,
                 )
             )
         except JobError as exc:
@@ -506,13 +509,25 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
         return JSONResponse(job.as_dict(), status_code=200 if job.done else 202)
 
     @app.get("/jobs")
-    async def list_jobs(limit: int = 50, workspace: str = "", status: str = "") -> dict[str, Any]:
-        return {"jobs": [job.summary() for job in manager.list(limit, workspace, status)]}
+    async def list_jobs(
+        limit: int = 50, workspace: str = "", status: str = "", conversation_id: str = ""
+    ) -> dict[str, Any]:
+        return {"jobs": [job.summary() for job in manager.list(limit, workspace, status, conversation_id)]}
 
     @app.get("/jobs/overview")
-    async def jobs_overview(workspace: str = "", status: str = "", finished: int = 20) -> dict[str, Any]:
+    async def jobs_overview(
+        workspace: str = "", status: str = "", finished: int = 20, conversation_id: str = ""
+    ) -> dict[str, Any]:
         """Same as the agent_jobs MCP tool: open jobs plus the last `finished` ended ones (or a status filter)."""
-        return {"jobs": [manager.describe(job) for job in manager.overview(workspace, status, finished)]}
+        rows = manager.overview(workspace, status, finished, conversation_id)
+        return {"jobs": [manager.describe(job) for job in rows]}
+
+    @app.post("/conversations/{conversation_id}/cancel")
+    async def cancel_conversation(conversation_id: str) -> dict[str, Any]:
+        """Cancel every queued and running job of one client conversation (agent_cancel conversation_id=...)."""
+        jobs = manager.cancel_conversation(conversation_id, "Cancelled (conversation cancel).")
+        await asyncio.gather(*(manager.wait(job, 15) for job in jobs))
+        return {"conversation_id": conversation_id.strip(), "cancelled": [manager.describe(job) for job in jobs]}
 
     def _job_or_404(job_id: str):
         job = manager.get(job_id)
@@ -528,9 +543,14 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
         return _job_body(job)
 
     def _job_body(job) -> dict[str, Any]:
+        from agent_worker.tasks import task_view
+
         body = job.as_dict()
         if not job.done:
-            body.update(job.live(), blocked_by=manager.blocked_by(job))
+            blocked = manager.blocked_by(job)
+            body.update(job.live(), blocked_by=blocked, status_message=job.status_message(blocked))
+        body["task"] = task_view(job, poll_interval_ms=settings.task_poll_interval_ms,
+                                 status_message=body["status_message"])
         return body
 
     @app.get("/jobs/{job_id}/events")
@@ -547,7 +567,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
                     yield ": ping\n\n"
                     continue
                 yield _sse(event)
-            yield _sse({"type": "end", "status": job.status, "job": job.as_dict()})
+            yield _sse({"type": "end", "status": job.public_status(), "job": job.as_dict()})
 
         return StreamingResponse(
             stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
@@ -555,7 +575,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
 
     @app.post("/jobs/{job_id}/approve")
     async def approve_job(job_id: str, body: Decision) -> dict[str, Any]:
-        """A human's answer to a job in needs_approval."""
+        """A human's answer to a job in input_required (needs_approval before 0.5.0)."""
         try:
             job = manager.decide(job_id, body.approve, body.note)
         except JobError as exc:

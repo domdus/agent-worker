@@ -25,6 +25,7 @@ from agent_worker.images import parse_image
 from agent_worker.jobs import Job, JobError, JobManager, JobRequest
 from agent_worker.mcp_config import DEPTH_HEADER, parse_depth
 from agent_worker.settings import steps_mode
+from agent_worker.tasks import CANCELLED, COMPLETED, INPUT_REQUIRED
 from agent_worker.workspaces import WorkspaceError, resolve
 
 logger = logging.getLogger(__name__)
@@ -174,9 +175,9 @@ def _usage(job: Job) -> dict[str, int]:
 
 
 def _answer(job: Job) -> str:
-    if job.status == "succeeded":
+    if job.status == COMPLETED:
         return job.result
-    if job.status == "cancelled":
+    if job.status == CANCELLED:
         return job.result or "(cancelled)"
     detail = job.error or "The agent failed."
     return f"{job.result}\n\n**Agent worker error:** {detail}".strip()
@@ -272,7 +273,7 @@ async def sse_reply(
                 yield out.keepalive()
         if not job.done:
             return
-        if job.status == "succeeded":
+        if job.status == COMPLETED:
             if not streamed and job.result:
                 yield out.chunk({"content": job.result})
             for line in out.finish(_usage(job)):
@@ -280,10 +281,10 @@ async def sse_reply(
         else:
             if not streamed and job.result:
                 yield out.chunk({"content": job.result})
-            if job.status == "cancelled":
+            if job.status == CANCELLED:
                 yield out.error(job.error or "The job was cancelled.", "agent_cancelled", "cancelled")
             else:
-                yield out.error(job.error or "The agent failed.", "agent_error", job.status)
+                yield out.error(job.error or "The agent failed.", "agent_error", job.public_status())
             yield out.done()
         finished = True
     finally:
@@ -404,7 +405,7 @@ async def _wait_or_leave(request: Request, manager: JobManager, job: Job) -> boo
     while True:
         left = deadline - loop.time()
         await manager.wait(job, min(DISCONNECT_POLL_SECONDS, max(left, 0)), stop_on_approval=True)
-        if job.done or job.status == "needs_approval" or left <= 0:
+        if job.done or job.status == INPUT_REQUIRED or left <= 0:
             return True
         if await request.is_disconnected():
             logger.info("job %s: the client hung up, cancelling", job.id)
@@ -419,10 +420,10 @@ async def _respond(request: Request, manager: JobManager, body: dict, job: Job, 
     if not body.get("stream"):
         if not await _wait_or_leave(request, manager, job):
             return _error_response(499, "The client closed the request; the job was cancelled.", "agent_cancelled")
-        if job.status == "needs_approval":
+        if job.status == INPUT_REQUIRED:
             return _reply(body, job, (job.result or "") + approval_prompt(job))
         return _completion(cid, shown, _answer(job), _usage(job),
-                           {"agent_worker": {"job_id": job.id, "status": job.status, "changes": job.changes}})
+                           {"agent_worker": {"job_id": job.id, "status": job.public_status(), "changes": job.changes}})
 
     steps = steps_mode(request.headers.get("x-agent-steps")) or manager.settings.openai_steps
     out = ChunkWriter(cid, shown, _include_usage(body))

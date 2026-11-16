@@ -40,11 +40,11 @@ async def test_job_waiting_for_its_workspace_does_not_hold_a_slot(settings, engi
     third = manager.submit(JobRequest(task="c", workspace="other"))
     await asyncio.sleep(0.05)
     # Before 0.5.0 b took the second slot while it waited for a, and c (another workspace) had to wait.
-    assert first.status == "running" and third.status == "running" and second.status == "queued"
+    assert first.status == "working" and third.status == "working" and second.status == "queued"
     engine.gate.set()
     for job in (first, second, third):
         await manager.wait(job, 5)
-        assert job.status == "succeeded"
+        assert job.status == "completed"
 
 
 async def test_slot_wait_is_reported(settings, engine):
@@ -79,7 +79,7 @@ async def test_overview_shows_open_jobs_blockers_and_no_full_prompt(settings, en
     assert [r["job_id"] for r in rows[:2]] == [queued.id, running.id]
     assert len(rows) == 4  # two open, the last two that ended
     run_row = next(r for r in rows if r["job_id"] == running.id)
-    assert run_row["status"] == "running" and run_row["model"] == "gpt-5" and run_row["engine"] == "cursor"
+    assert run_row["status"] == "working" and run_row["model"] == "gpt-5" and run_row["engine"] == "cursor"
     assert len(run_row["task_preview"]) <= 120 and long_task not in str(rows)
     assert run_row["runtime_seconds"] is not None and run_row["last_step"] == "Calling shell..."
     assert run_row["last_event_at"] and run_row["waiting_for_approval"] is False
@@ -115,7 +115,7 @@ async def test_cancel_workspace_frees_it_for_the_next_job(settings, engine):
     engine.gate = None
     after = manager.submit(JobRequest(task="d"))
     await manager.wait(after, 5)
-    assert after.status == "succeeded"
+    assert after.status == "completed"
     engine.gate = asyncio.Event()
     engine.gate.set()
 
@@ -159,7 +159,7 @@ async def test_cancel_frees_the_workspace_when_the_engine_hangs(settings, monkey
     await manager.wait(stuck, 5)
     assert stuck.status == "cancelled"
     await manager.wait(behind, 5)
-    assert behind.status == "succeeded" and behind.result == "second"
+    assert behind.status == "completed" and behind.result == "second"
     engine.release.set()
     await asyncio.sleep(0.01)
 
@@ -212,7 +212,7 @@ async def test_idle_timeout_fails_the_job_and_frees_the_workspace(settings, engi
     assert job.status == "failed" and "JOB_IDLE_TIMEOUT_SECONDS" in job.error
     engine.gate.set()
     await manager.wait(behind, 5)
-    assert behind.status == "succeeded"
+    assert behind.status == "completed"
 
 
 async def test_max_runtime_fails_the_job(settings, engine):
@@ -231,7 +231,7 @@ async def test_approval_watchdog_cancels_a_forgotten_approval(settings, engine):
     job = manager.submit(JobRequest(task="a"))
     await asyncio.sleep(0.05)
     call = asyncio.create_task(manager.remote_call("default", "ssh", "prod", "", "root", "reboot"))
-    await _until(lambda: job.status == "needs_approval")
+    await _until(lambda: job.status == "input_required")
     row = manager.describe(job)
     assert row["waiting_for_approval"] and row["approval"]["host"] == "prod" and row["approval"]["command"] == "reboot"
     await manager.wait(job, 5)
@@ -282,14 +282,14 @@ async def test_agent_run_wait_is_capped_and_returns_the_job_id(settings, engine)
             "agent_run", {"task": "slow", "wait_seconds": 600}, progress_callback=on_progress
         ))
         assert time.monotonic() - started < 5
-        assert first["status"] == "running" and first["job_id"] and first["model"] == "composer-2.5"
+        assert first["status"] == "working" and first["job_id"] and first["model"] == "composer-2.5"
         assert first["runtime_seconds"] is not None and first["last_step"]
         assert progress and progress[0].startswith(f"job {first['job_id']}")
         listed = _data(await client.call_tool("agent_jobs", {}))
         assert [row["job_id"] for row in listed["jobs"]] == [first["job_id"]]
         engine.gate.set()
         done = _data(await client.call_tool("agent_job", {"job_id": first["job_id"], "wait_seconds": 5}))
-    assert done["status"] == "succeeded" and done["model"] == "composer-2.5"
+    assert done["status"] == "completed" and done["model"] == "composer-2.5"
 
 
 async def test_agent_cancel_by_workspace(settings, engine):
@@ -334,4 +334,4 @@ async def test_http_overview_and_workspace_cancel(settings, engine):
         assert sorted(row["status"] for row in out["cancelled"]) == ["cancelled", "cancelled"]
         engine.gate.set()
         third = (await http.post("/jobs", json={"task": "c", "wait": 5})).json()
-        assert third["status"] == "succeeded"
+        assert third["status"] == "completed"

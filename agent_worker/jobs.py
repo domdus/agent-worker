@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from agent_worker import proctree
+from agent_worker import tasks as st
 from agent_worker.engine import JOB_ENV, Engine, EngineError, RunSpec
 from agent_worker.mcp_config import McpConfigError, load_mcp_servers, servers_from_request, with_depth
 from agent_worker.settings import Settings, narrow_profile, touches_files
@@ -28,7 +29,8 @@ from agent_worker.workspaces import WorkspaceError, resolve
 
 logger = logging.getLogger(__name__)
 
-TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
+# Status names: agent_worker.tasks (MCP Task vocabulary plus "queued"; the names before 0.5.0 still read).
+TERMINAL = st.TERMINAL
 _MAX_EVENTS = 5000
 # Past _MAX_EVENTS only these still count: dropping answer text, the outcome or an approval would break
 # a live chat stream. Text past the cap stays in memory only (the result is saved with the job anyway).
@@ -83,6 +85,54 @@ class JobRequest:
     depth: int = 0
     origin: str = "api"
     engine: str = ""
+    # Opaque id of the client's conversation (MCP _meta, see conversation_from_meta). Never a secret.
+    conversation_id: str = ""
+    # MCP: the job is not bound to the tools/call that started it (a cancelled call or disconnect leaves it).
+    background: bool = False
+
+
+# Keys accepted in a request's _meta for the conversation id, preferred first. The namespaced one follows
+# the MCP _meta naming rules (reverse-DNS prefix + "/"); contextId is A2A's name for the same thing.
+CONVERSATION_META_KEYS = (
+    "io.github.domdus/conversation_id",
+    "contextId",
+    "conversationId",
+    "conversation_id",
+)
+_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-/@#+=")
+# Values that look like credentials are refused: the id is shown in job lists and logs.
+_SECRET_PREFIXES = ("sk-", "sk_", "ghp_", "gho_", "ghs_", "ghu_", "github_pat_", "xox", "glpat-", "eyj", "bearer",
+                    "akia", "aiza")
+
+
+def clean_conversation_id(value: Any, secrets: tuple[str, ...] = ()) -> str:
+    """A usable conversation id, or "" (missing, too long, odd characters or looks like a secret)."""
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        return ""
+    text = str(value).strip()
+    if not text or len(text) > 128 or any(ch not in _ID_CHARS for ch in text):
+        if text:
+            logger.warning("conversation id ignored: not an opaque id of at most 128 safe characters")
+        return ""
+    low = text.lower()
+    if low.startswith(_SECRET_PREFIXES) or any(secret and secret in text for secret in secrets):
+        logger.warning("conversation id ignored: it looks like a credential")
+        return ""
+    return text
+
+
+def conversation_from_meta(meta: Any) -> str:
+    """The raw conversation id from an MCP request's _meta (first known key that is set), else ""."""
+    if not isinstance(meta, dict):
+        try:
+            meta = dict(meta or {})
+        except (TypeError, ValueError):
+            return ""
+    for key in CONVERSATION_META_KEYS:
+        value = meta.get(key)
+        if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value).strip():
+            return str(value)
+    return ""
 
 
 @dataclass
@@ -95,8 +145,10 @@ class Job:
     profile: str
     origin: str
     engine: str = "cursor"
-    status: str = "queued"
+    status: str = st.QUEUED
     created_at: str = field(default_factory=_now)
+    # Last status change (the MCP Task lastUpdatedAt).
+    updated_at: str = ""
     started_at: str = ""
     finished_at: str = ""
     result: str = ""
@@ -126,10 +178,43 @@ class Job:
     waiting_key: tuple = field(default=(), repr=False)
     held: list[tuple] = field(default_factory=list, repr=False)
     spec: RunSpec | None = field(default=None, repr=False)
+    conversation_id: str = ""
+    background: bool = False
+    # JOB_STATUS_NAMES=legacy: `status` in answers uses the names before 0.5.0.
+    legacy_names: bool = field(default=False, repr=False)
 
     @property
     def done(self) -> bool:
         return self.status in TERMINAL
+
+    def set_status(self, status: str) -> None:
+        self.status = status
+        self.updated_at = _now()
+
+    def public_status(self) -> str:
+        return st.legacy(self.status) if self.legacy_names else self.status
+
+    def status_message(self, blocked_by: str | None = None) -> str:
+        """What the status means right now, for people and for the MCP Task statusMessage."""
+        if self.status == st.QUEUED:
+            what = {"workspace": "another job in this workspace", "session": "another job in this session",
+                    "slot": "a free slot (MAX_CONCURRENT_JOBS)"}.get(self.waiting_for, "its start")
+            return f"queued: waiting for {what}" + (f" (job {blocked_by})" if blocked_by else "")
+        if self.status == st.INPUT_REQUIRED:
+            approval = self.pending_approval or {}
+            if not approval:
+                return "input_required: waiting for a human answer"
+            target = f"{approval.get('user')}@{approval.get('host')}" if approval.get("user") else approval.get("host")
+            command = _short(approval.get("command") or "", 160)
+            return (f"input_required: waiting for a human to approve {approval.get('tool', 'ssh')} on {target}"
+                    + (f": {command}" if command else "") + " (POST /jobs/{id}/approve or MCP elicitation)").replace(
+                        "{id}", self.id)
+        if self.status == st.WORKING:
+            step, _ = self.last_step()
+            return step or "working"
+        if self.status == st.COMPLETED:
+            return _short(self.result, 200) or "completed"
+        return _short(self.error, 300) or self.status
 
     def last_step(self) -> tuple[str, str]:
         """(text, at) of the latest step (tool call, status, error, approval) and the time of the latest event."""
@@ -153,15 +238,20 @@ class Job:
         task = self.task if len(self.task) <= task_chars else self.task[:task_chars] + "…"
         return {
             "id": self.id,
-            "status": self.status,
+            "status": self.public_status(),
+            "legacy_status": st.legacy(self.status),
+            "status_message": self.status_message(),
             "engine": self.engine,
             "workspace": self.workspace,
             "session": self.session or None,
+            "conversation_id": self.conversation_id or None,
+            "background": self.background,
             "model": self.model,
             "tools": self.profile,
             "origin": self.origin,
             "task": task,
             "created_at": self.created_at,
+            "updated_at": self.updated_at or self.created_at,
             "started_at": self.started_at or None,
             "finished_at": self.finished_at or None,
             "approval": self.pending_approval,
@@ -204,7 +294,7 @@ class Store:
         )
 
     def save(self, job: Job) -> None:
-        data = json.dumps({**job.as_dict(), "task": job.task}, ensure_ascii=False)
+        data = json.dumps({**job.as_dict(), "task": job.task, "status": job.status}, ensure_ascii=False)
         with self._lock:
             self._db.execute(
                 "INSERT INTO jobs (id, created_at, data) VALUES (?, ?, ?) "
@@ -273,6 +363,8 @@ class JobManager:
         # ("workspace", name) or ("session", name, session) -> lock, and which job holds it.
         self._locks: dict[tuple, asyncio.Lock] = {}
         self._holders: dict[tuple, str] = {}
+        self._legacy_names = settings.job_status_names == "legacy"
+        self.closing = False
         self._restore()
 
     def _restore(self) -> None:
@@ -286,8 +378,13 @@ class JobManager:
                 profile=data.get("tools") or "",
                 origin=data.get("origin") or "api",
                 engine=data.get("engine") or "cursor",
-                status=data.get("status") or "failed",
+                # Jobs saved before 0.5.0 carry the old names (succeeded, running, ...).
+                status=st.normalize(data.get("status")) or st.FAILED,
                 created_at=data.get("created_at") or _now(),
+                updated_at=data.get("updated_at") or "",
+                conversation_id=data.get("conversation_id") or "",
+                background=bool(data.get("background")),
+                legacy_names=self._legacy_names,
                 started_at=data.get("started_at") or "",
                 finished_at=data.get("finished_at") or "",
                 result=data.get("result") or "",
@@ -300,7 +397,7 @@ class JobManager:
                 events=events,
             )
             if not job.done:
-                job.status = "failed"
+                job.set_status(st.FAILED)
                 job.error = "The worker restarted while this job was running."
                 job.finished_at = _now()
                 self.store.save(job)
@@ -375,17 +472,26 @@ class JobManager:
             origin=req.origin,
             engine=spec.engine,
             spec=spec,
+            conversation_id=clean_conversation_id(req.conversation_id, self._secrets()),
+            background=bool(req.background),
+            legacy_names=self._legacy_names,
         )
+        job.updated_at = job.created_at
         self.jobs[job.id] = job
         self.store.save(job)
         self._prune()
         job.task_handle = asyncio.create_task(self._run(job, spec), name=f"job-{job.id}")
         job.task_handle.add_done_callback(lambda _t, job=job: self._settle(job))
         logger.info(
-            "job %s queued engine=%s workspace=%s session=%s tools=%s origin=%s",
-            job.id, job.engine, job.workspace, job.session or "-", job.profile, job.origin,
+            "job %s queued engine=%s workspace=%s session=%s tools=%s origin=%s conversation=%s",
+            job.id, job.engine, job.workspace, job.session or "-", job.profile, job.origin, job.conversation_id or "-",
         )
         return job
+
+    def _secrets(self) -> tuple[str, ...]:
+        s = self.settings
+        return tuple(v for v in (s.token, s.cursor_api_key, s.claude_oauth_token, s.anthropic_api_key,
+                                 s.openai_api_key) if v)
 
     def _prune(self) -> None:
         keep = self.settings.keep_jobs
@@ -412,13 +518,13 @@ class JobManager:
     def _settle(self, job: Job) -> None:
         """A task cancelled before its first step never enters _run; close the job here."""
         if not job.done:
-            self._finish(job, "cancelled", error="Cancelled before it started.")
+            self._finish(job, st.CANCELLED, error=job.stop_reason or "Cancelled before it started.")
 
     def _finish(self, job: Job, status: str, **fields: Any) -> None:
         if job.approval_future is not None and not job.approval_future.done():
             job.approval_future.set_result((False, "The job ended."))
         job.pending_approval = None
-        job.status = status
+        job.set_status(status)
         job.finished_at = _now()
         for key, value in fields.items():
             setattr(job, key, value)
@@ -465,7 +571,7 @@ class JobManager:
                 )
             async with self._slots:
                 job.waiting_for, job.waiting_key = "", ()
-                job.status = "running"
+                job.set_status(st.WORKING)
                 job.started_at = _now()
                 job.started_clock = job.activity_clock = loop.time()
                 self.store.save(job)
@@ -473,8 +579,8 @@ class JobManager:
                 try:
                     outcome = await self._supervise(job, spec)
                 except _Stopped:
-                    status, message = job.stop_status or "cancelled", job.stop_reason or "Cancelled."
-                    await self._emit(job, {"type": "error" if status == "failed" else "status", "message": message,
+                    status, message = job.stop_status or st.CANCELLED, job.stop_reason or "Cancelled."
+                    await self._emit(job, {"type": "error" if status == st.FAILED else "status", "message": message,
                                            "text": message})
                     self._finish(job, status, error=message)
                     await self._cleanup(job, spec)
@@ -490,22 +596,24 @@ class JobManager:
             )
             if outcome.model:
                 fields["model"] = outcome.model
-            if outcome.status == "succeeded":
+            # Engines report succeeded/failed/cancelled; the job uses the MCP Task names.
+            status = st.normalize(outcome.status) or st.FAILED
+            if status == st.COMPLETED:
                 await self._emit(job, {"type": "result", "text": outcome.text})
             else:
                 await self._emit(job, {"type": "error", "message": outcome.error})
-            self._finish(job, outcome.status, **fields)
+            self._finish(job, status, **fields)
         except asyncio.CancelledError:
             await self._emit(job, {"type": "status", "text": "Cancelled"})
-            self._finish(job, "cancelled", error=job.stop_reason or job.error or "Cancelled.")
+            self._finish(job, st.CANCELLED, error=job.stop_reason or job.error or "Cancelled.")
         except EngineError as exc:
             await self._emit(job, {"type": "error", "message": str(exc)})
-            self._finish(job, "failed", error=str(exc))
+            self._finish(job, st.FAILED, error=str(exc))
         except Exception as exc:
             logger.exception("job %s crashed", job.id)
             message = f"The worker failed: {type(exc).__name__}"
             await self._emit(job, {"type": "error", "message": message})
-            self._finish(job, "failed", error=message)
+            self._finish(job, st.FAILED, error=message)
         finally:
             job.waiting_for, job.waiting_key = "", ()
             self._release(job)
@@ -513,16 +621,16 @@ class JobManager:
     def _overdue(self, job: Job, now: float) -> tuple[str, str] | None:
         """(status, reason) when a watchdog limit is past, else None."""
         settings = self.settings
-        if job.status == "needs_approval":
+        if job.status == st.INPUT_REQUIRED:
             if job.approval_clock and now - job.approval_clock >= settings.approval_timeout:
-                return "cancelled", self._approval_timeout_reason(job)
+                return st.CANCELLED, self._approval_timeout_reason(job)
         elif settings.job_idle_timeout > 0 and now - job.activity_clock >= settings.job_idle_timeout:
-            return "failed", (
+            return st.FAILED, (
                 f"No output or progress from the engine for {settings.job_idle_timeout} s "
                 "(JOB_IDLE_TIMEOUT_SECONDS); the job was stopped."
             )
         if now - job.started_clock >= settings.job_timeout:
-            return "failed", f"The job ran longer than JOB_MAX_RUNTIME_SECONDS ({settings.job_timeout}s) and was stopped."
+            return st.FAILED, f"The job ran longer than JOB_MAX_RUNTIME_SECONDS ({settings.job_timeout}s) and was stopped."
         return None
 
     def _approval_timeout_reason(self, job: Job) -> str:
@@ -533,7 +641,7 @@ class JobManager:
     def _next_check(self, job: Job, now: float) -> float:
         settings = self.settings
         due = [job.started_clock + settings.job_timeout]
-        if job.status == "needs_approval" and job.approval_clock:
+        if job.status == st.INPUT_REQUIRED and job.approval_clock:
             due.append(job.approval_clock + settings.approval_timeout)
         elif settings.job_idle_timeout > 0:
             due.append(job.activity_clock + settings.job_idle_timeout)
@@ -592,19 +700,22 @@ class JobManager:
     def get(self, job_id: str) -> Job | None:
         return self.jobs.get(job_id)
 
-    def list(self, limit: int = 50, workspace: str = "", status: str = "") -> list[Job]:
+    def list(self, limit: int = 50, workspace: str = "", status: str = "", conversation_id: str = "") -> list[Job]:
         rows = sorted(self.jobs.values(), key=lambda j: j.created_at, reverse=True)
         if workspace:
             rows = [j for j in rows if j.workspace == workspace]
         if status:
-            rows = [j for j in rows if j.status == status]
+            wanted = st.parse_filter(status)
+            rows = [j for j in rows if j.status in wanted]
+        if conversation_id:
+            rows = [j for j in rows if j.conversation_id == conversation_id.strip()]
         return rows[: max(1, min(limit, 500))]
 
     def request_stop(self, job: Job, status: str, reason: str) -> bool:
         """Ask a running job to stop; it ends as `status` with `reason` as its error. The first reason wins."""
         if job.done or job.stop.is_set():
             return False
-        job.stop_status, job.stop_reason = status, reason
+        job.stop_status, job.stop_reason = st.normalize(status) or st.CANCELLED, reason
         if job.approval_future is not None and not job.approval_future.done():
             job.approval_future.set_result((False, reason))
         job.stop.set()
@@ -618,7 +729,7 @@ class JobManager:
         if job.done:
             return job
         if job.started_at:
-            self.request_stop(job, "cancelled", reason)
+            self.request_stop(job, st.CANCELLED, reason)
         elif job.task_handle is not None:
             job.stop_reason = job.stop_reason or reason
             job.task_handle.cancel()
@@ -633,9 +744,20 @@ class JobManager:
             self.cancel(job.id, reason)
         return pending
 
+    def cancel_conversation(self, conversation_id: str, reason: str = "Cancelled.") -> list[Job]:
+        """Cancel every job of this conversation that has not ended (queued ones first)."""
+        wanted = (conversation_id or "").strip()
+        if not wanted:
+            return []
+        pending = [j for j in self.jobs.values() if j.conversation_id == wanted and not j.done]
+        pending.sort(key=lambda j: (bool(j.started_at), j.created_at))
+        for job in pending:
+            self.cancel(job.id, reason)
+        return pending
+
     def blocked_by(self, job: Job) -> str | None:
         """The job holding the lock a queued job waits for."""
-        if job.status != "queued" or not job.waiting_key:
+        if job.status != st.QUEUED or not job.waiting_key:
             return None
         return self._holders.get(job.waiting_key) or None
 
@@ -643,18 +765,24 @@ class JobManager:
         """One row of agent_jobs / GET /jobs/overview: what runs where, for how long, waiting for what.
         No secrets and no full prompt (a short preview of the task only)."""
         step, last = job.last_step()
-        approval = job.pending_approval if job.status == "needs_approval" else None
+        approval = job.pending_approval if job.status == st.INPUT_REQUIRED else None
+        blocked = self.blocked_by(job)
         row: dict[str, Any] = {
             "job_id": job.id,
-            "status": job.status,
+            "status": job.public_status(),
+            "legacy_status": st.legacy(job.status),
+            "status_message": job.status_message(blocked),
             "workspace": job.workspace,
             "engine": job.engine,
             "model": job.model or None,
             "session": job.session or None,
             "tools": job.profile,
             "origin": job.origin,
+            "conversation_id": job.conversation_id or None,
+            "background": job.background,
             "task_preview": _short(job.task, 120),
             "created_at": job.created_at,
+            "updated_at": job.updated_at or job.created_at,
             "started_at": job.started_at or None,
             "finished_at": job.finished_at or None,
             "runtime_seconds": job.runtime_seconds(),
@@ -668,21 +796,24 @@ class JobManager:
                 "command": _short(approval.get("command") or "", 200) or None,
                 "requested_at": approval.get("requested_at"),
             } if approval else None,
-            "waiting_for": (job.waiting_for or None) if job.status == "queued" else None,
-            "blocked_by": self.blocked_by(job),
+            "waiting_for": (job.waiting_for or None) if job.status == st.QUEUED else None,
+            "blocked_by": blocked,
         }
         if job.done and job.error:
             row["error"] = _short(job.error, 300)
         return row
 
-    def overview(self, workspace: str = "", status: str = "", finished: int = 20) -> list[Job]:
-        """Jobs that have not ended plus the last `finished` ones; or only the given statuses (comma-separated)."""
+    def overview(self, workspace: str = "", status: str = "", finished: int = 20, conversation_id: str = "") -> list[Job]:
+        """Jobs that have not ended plus the last `finished` ones; or only the given statuses (comma-separated,
+        current or pre-0.5.0 names). conversation_id narrows to one client conversation."""
         rows = sorted(self.jobs.values(), key=lambda j: j.created_at, reverse=True)
         if workspace:
             name = workspace.strip().lower()
             rows = [j for j in rows if j.workspace == name]
-        wanted = {part.strip().lower() for part in (status or "").split(",") if part.strip()}
-        if wanted:
+        if conversation_id:
+            rows = [j for j in rows if j.conversation_id == conversation_id.strip()]
+        if status and status.strip():
+            wanted = st.parse_filter(status)
             return [j for j in rows if j.status in wanted][:500]
         active = [j for j in rows if not j.done]
         ended = [j for j in rows if j.done][: max(0, min(finished, 500))]
@@ -692,7 +823,7 @@ class JobManager:
         """Wait until the job ends (or asks for approval) or the timeout passes, whichever is first."""
 
         def settled() -> bool:
-            return job.done or (stop_on_approval and job.status == "needs_approval")
+            return job.done or (stop_on_approval and job.status == st.INPUT_REQUIRED)
 
         if settled() or timeout <= 0:
             return job
@@ -734,7 +865,7 @@ class JobManager:
     def active_job(self, workspace: str) -> Job | None:
         """The job whose agent has a shell in this workspace. File jobs hold the workspace lock, so at most one."""
         for job in sorted(self.jobs.values(), key=lambda j: j.created_at, reverse=True):
-            if job.workspace == workspace and job.status in {"running", "needs_approval"} and touches_files(job.profile):
+            if job.workspace == workspace and job.status in {st.WORKING, st.INPUT_REQUIRED} and touches_files(job.profile):
                 return job
         return None
 
@@ -776,7 +907,7 @@ class JobManager:
             job.approval_future = loop.create_future()
             job.pending_approval = approval
             job.approval_clock = loop.time()
-            job.status = "needs_approval"
+            job.set_status(st.INPUT_REQUIRED)
             self.store.save(job)
             await self._emit(job, {"type": "approval", **approval, "text": f"Approval needed: {label}"})
             logger.info("job %s waits for approval: %s", job.id, label)
@@ -788,14 +919,14 @@ class JobManager:
                 # Nobody answered: the whole job ends, it does not go on without the command.
                 note = self._approval_timeout_reason(job)
                 allow = False
-                self.request_stop(job, "cancelled", note)
+                self.request_stop(job, st.CANCELLED, note)
             finally:
                 job.approval_future = None
                 job.pending_approval = None
                 job.approval_clock = 0.0
                 job.activity_clock = asyncio.get_running_loop().time()
-                if not job.done:
-                    job.status = "running"
+                if not job.done and job.status != st.WORKING:
+                    job.set_status(st.WORKING)
                     self.store.save(job)
             if allow:
                 job.approved_hosts.add(alias.lower())
@@ -813,24 +944,26 @@ class JobManager:
         if job is None:
             raise JobError("Job not found.", status=404)
         future = job.approval_future
-        if job.status != "needs_approval" or future is None or future.done():
+        if job.status != st.INPUT_REQUIRED or future is None or future.done():
             raise JobError("This job is not waiting for an approval.", status=409)
         future.set_result((bool(allow), (note or "").strip()[:300]))
         # Switch now, not when the waiting call wakes up, so a caller that reads the job next sees it moving.
         job.pending_approval = None
-        job.status = "running"
+        job.set_status(st.WORKING)
         self.store.save(job)
         job.changed.set()
         return job
 
     def pending_for(self, workspace: str, session: str, origin: str) -> Job | None:
         for job in sorted(self.jobs.values(), key=lambda j: j.created_at, reverse=True):
-            if job.status == "needs_approval" and job.workspace == workspace and job.origin == origin:
+            if job.status == st.INPUT_REQUIRED and job.workspace == workspace and job.origin == origin:
                 if not session or job.session == session:
                     return job
         return None
 
     async def aclose(self) -> None:
+        # From here on, MCP calls that end because the server stops do not count as client disconnects.
+        self.closing = True
         running = [j.task_handle for j in self.jobs.values() if j.task_handle is not None and not j.done]
         for handle in running:
             handle.cancel()
