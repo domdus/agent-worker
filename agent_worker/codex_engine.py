@@ -422,8 +422,10 @@ class CodexEngine:
     def forget(self, workspace: str, session: str) -> None:
         self._set_session(self._key(workspace), session, "")
 
-    def _codex(self, *, api_key: bool, cwd: str | None, workspace: str) -> Any:
-        config = sdk_config(self.settings, store="ephemeral" if api_key else "file", cwd=cwd, workspace=workspace)
+    def _codex(self, *, api_key: bool, cwd: str | None, workspace: str, job_id: str = "") -> Any:
+        config = sdk_config(
+            self.settings, store="ephemeral" if api_key else "file", cwd=cwd, workspace=workspace, job_id=job_id
+        )
         if self._factory is not None:
             return self._factory(config)
         from openai_codex import AsyncCodex
@@ -490,7 +492,7 @@ class CodexEngine:
         await emit({"type": "status", "text": "Starting Codex..."})
         key = self._key(spec.workspace)
         resume = self._get_session(key, spec.session) if spec.session else None
-        codex = self._codex(api_key=api_key, cwd=str(spec.path), workspace=spec.workspace)
+        codex = self._codex(api_key=api_key, cwd=str(spec.path), workspace=spec.workspace, job_id=spec.job_id)
         state = TurnState()
         thread_id = ""
         used_model = resolve_model(self.settings, spec.model)

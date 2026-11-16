@@ -90,18 +90,21 @@ def cli_path() -> str:
     return shutil.which("codex") or ""
 
 
-def child_env(settings: Settings, workspace: str = "") -> dict[str, str]:
+def child_env(settings: Settings, workspace: str = "", job_id: str = "") -> dict[str, str]:
     """Merged onto os.environ for Codex: the worker's secrets blanked, CODEX_HOME in the data volume.
 
     The agent's shell inherits this, so it is also what a command run by the agent can read.
     GIT_TOKEN stays: git in the workspace uses it through the credential helper.
     """
-    from agent_worker.engine import WORKSPACE_ENV
+    from agent_worker.engine import JOB_ENV, WORKSPACE_ENV
 
     env = {key: "" for key in SECRET_ENV if key in os.environ}
     env["CODEX_HOME"] = str(settings.codex_home)
     if workspace:
         env[WORKSPACE_ENV] = workspace
+    if job_id:
+        # How a stopped job's leftover processes are found (proctree).
+        env[JOB_ENV] = job_id
     return env
 
 
@@ -114,7 +117,9 @@ def launch_overrides(store: str = "file") -> tuple[str, ...]:
     )
 
 
-def sdk_config(settings: Settings, *, store: str = "file", cwd: str | None = None, workspace: str = "") -> Any:
+def sdk_config(
+    settings: Settings, *, store: str = "file", cwd: str | None = None, workspace: str = "", job_id: str = ""
+) -> Any:
     from openai_codex import CodexConfig
 
     settings.codex_home.mkdir(parents=True, exist_ok=True)
@@ -123,7 +128,7 @@ def sdk_config(settings: Settings, *, store: str = "file", cwd: str | None = Non
         codex_bin=os.environ.get("CODEX_BIN", "").strip() or None,
         config_overrides=launch_overrides(store) + tuple(settings.codex_config),
         cwd=cwd,
-        env=child_env(settings, workspace),
+        env=child_env(settings, workspace, job_id),
         client_name="agent_worker",
         client_title="Agent Worker",
     )
