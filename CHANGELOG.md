@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 (unreleased)
+## 0.5.0 (2026-11-16)
 
 Job visibility, cancel that frees the workspace, watchdogs; job handling aligned with MCP (cancellation, Task statuses, conversation id in `_meta`).
 
@@ -28,5 +28,13 @@ Job visibility, cancel that frees the workspace, watchdogs; job handling aligned
 - Defaults: max runtime 1800 → 3600 s, approval timeout 900 → 1800 s. An approval timeout now cancels the job (before: only the one command was refused).
 - `agent_job` waits at most `MCP_MAX_WAIT_SECONDS` (was 600); call it again while the job runs.
 - Renamed settings (old names still work): `JOB_TIMEOUT_SECONDS` → `JOB_MAX_RUNTIME_SECONDS`, `SSH_APPROVAL_TIMEOUT` → `APPROVAL_TIMEOUT_SECONDS`.
+- `docker-compose.yml` pins the image to `ghcr.io/domdus/agent-worker:0.5.0` (was `:latest`).
+
+### Upgrade notes
+
+- Image: `ghcr.io/domdus/agent-worker:0.5.0` (pull and `docker compose up -d --no-build` in your compose project dir with the existing `.env`).
+- **Data volume:** the compose project is `agent-worker` with the volume `agent-worker-data` (on the host: `agent-worker_agent-worker-data`). A container still started from the old cursor-worker compose uses `cursor-worker_data`; that volume is **not** reused. The new container starts empty: jobs, sessions, workspaces and stored sign-ins (`/data/claude`, `/data/codex`, `/data/cursor`) are not carried over. Sign in again, and let `GIT_REPO`/`GIT_TOKEN` clone the default workspace again. The old volume stays on the host until you remove it.
+- Clients that compare `status` strings: the new names are `working`, `input_required` and `completed`. Read `legacy_status` or set `JOB_STATUS_NAMES=legacy`.
+- Defaults changed: max runtime 3600 s, approval timeout 1800 s, and an unanswered approval now cancels the job. No MCP call waits longer than `MCP_MAX_WAIT_SECONDS` (25); poll `agent_job` with the `job_id`.
 
 Earlier versions: see the [GitHub releases](https://github.com/domdus/agent-worker/releases).

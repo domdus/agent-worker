@@ -35,7 +35,7 @@ CURSOR_MODEL=composer-2.5
 ```yaml
 services:
   agent-worker:
-    image: ghcr.io/domdus/agent-worker:latest   # or pin a version, e.g. :0.2.0
+    image: ghcr.io/domdus/agent-worker:latest   # or pin a version, e.g. :0.5.0
     container_name: agent-worker
     env_file: .env
     ports:
