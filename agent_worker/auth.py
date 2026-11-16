@@ -45,6 +45,12 @@ def engine_ready(engine: Any, name: str) -> bool:
     return name in engines and bool(engines[name].available)
 
 
+def default_model(settings: Settings, engine: str) -> str | None:
+    """CURSOR_MODEL, CLAUDE_MODEL or CODEX_MODEL (None when unset: Codex uses the account's default)."""
+    value = {"cursor": settings.model, "claude": settings.claude_model, "codex": settings.codex_model}.get(engine, "")
+    return value or None
+
+
 def _login(login: Any, reveal: bool) -> dict[str, Any] | None:
     if login is None:
         return None
@@ -130,6 +136,9 @@ def auth_status(
         "codex": lambda: codex_status(settings, engine, codex_login, reveal),
     }
     engines = {name: builders[name]() for name in ("cursor", "claude", "codex") if name in builders}
+    for name, row in engines.items():
+        # The model a job gets when it names none. None: the engine decides (Codex without CODEX_MODEL).
+        row["default_model"] = default_model(settings, name)
     default = engine.default() if hasattr(engine, "default") else "cursor"
     return {
         "default_engine": default,

@@ -156,16 +156,20 @@ async def test_hostname_pattern_and_denial(settings, engine):
 
 
 async def test_approval_timeout_and_cancel(settings, engine):
-    manager = _manager(settings, engine, ssh_approval_hosts=("prod",), ssh_approval_timeout=0)
+    manager = _manager(settings, engine, ssh_approval_hosts=("prod",), approval_timeout=0)
     job = await _running(manager, engine)
     allow, reason = await manager.remote_call("default", "ssh", "prod", "", "", "x")
-    assert not allow and "No answer" in reason
+    assert not allow and "approval timed out" in reason
+    # Nobody answered: the whole job is cancelled, not only the command.
+    await manager.wait(job, 5)
+    assert job.status == "cancelled" and job.error.startswith("approval timed out")
     manager2 = _manager(settings, engine, ssh_approval_hosts=("prod",))
     other = await _running(manager2, engine, workspace="two")
     call = asyncio.create_task(manager2.remote_call("two", "ssh", "prod", "", "", "x"))
     await asyncio.sleep(0.02)
     manager2.cancel(other.id)
     allow, _ = await call
+    await manager2.wait(other, 5)
     assert not allow and other.status == "cancelled"
     engine.gate.set()
     await manager.wait(job, 5)

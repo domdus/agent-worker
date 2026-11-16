@@ -1,4 +1,11 @@
-"""Jobs: queue, run, record events, cancel. One job writes to a workspace at a time."""
+"""Jobs: queue, run, record events, cancel, watch. One job writes to a workspace at a time.
+
+Parallelism: a job that may touch files (tools full, local, offline) holds its workspace's lock, so such
+jobs in one workspace run one after another, in the order they came in. Jobs in different workspaces,
+and chat-only jobs (tools mcp, none), run side by side, up to MAX_CONCURRENT_JOBS at once. Jobs with
+the same session also take turns. A job takes its locks before a slot, so a job that only waits for
+its workspace never holds a slot that a job in another workspace could use.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from agent_worker.engine import Engine, EngineError, RunSpec
+from agent_worker import proctree
+from agent_worker.engine import JOB_ENV, Engine, EngineError, RunSpec
 from agent_worker.mcp_config import McpConfigError, load_mcp_servers, servers_from_request, with_depth
 from agent_worker.settings import Settings, narrow_profile, touches_files
 from agent_worker.workspaces import WorkspaceError, resolve
@@ -25,6 +33,11 @@ _MAX_EVENTS = 5000
 # Past _MAX_EVENTS only these still count: dropping answer text, the outcome or an approval would break
 # a live chat stream. Text past the cap stays in memory only (the result is saved with the job anyway).
 _PAST_CAP = frozenset({"text", "result", "error", "approval"})
+# A stopped engine gets this long to wind down on its own before its processes are killed.
+STOP_GRACE = 10.0
+# Longest the watchdog sleeps between checks.
+_TICK = 5.0
+_STEP_TYPES = frozenset({"tool", "status", "error", "approval"})
 
 
 class JobError(ValueError):
@@ -37,6 +50,22 @@ class JobError(ValueError):
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _parse(stamp: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(stamp) if stamp else None
+    except ValueError:
+        return None
+
+
+def _short(text: str, limit: int) -> str:
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+class _Stopped(Exception):
+    """The job was stopped (cancel or a watchdog): job.stop_status and job.stop_reason say how and why."""
 
 
 @dataclass
@@ -84,10 +113,41 @@ class Job:
     task_handle: asyncio.Task | None = field(default=None, repr=False)
     approval_future: asyncio.Future | None = field(default=None, repr=False)
     approval_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # Watchdog clocks (event loop time): when the engine started, last event, when an approval was asked.
+    started_clock: float = field(default=0.0, repr=False)
+    activity_clock: float = field(default=0.0, repr=False)
+    approval_clock: float = field(default=0.0, repr=False)
+    # A cancel or a watchdog asks the running job to stop through this; the reason becomes the error.
+    stop: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    stop_status: str = ""
+    stop_reason: str = ""
+    # While queued: what it waits for ("workspace", "session" or "slot") and the lock's key.
+    waiting_for: str = ""
+    waiting_key: tuple = field(default=(), repr=False)
+    held: list[tuple] = field(default_factory=list, repr=False)
+    spec: RunSpec | None = field(default=None, repr=False)
 
     @property
     def done(self) -> bool:
         return self.status in TERMINAL
+
+    def last_step(self) -> tuple[str, str]:
+        """(text, at) of the latest step (tool call, status, error, approval) and the time of the latest event."""
+        step = ""
+        for event in reversed(self.events):
+            if event.get("type") in _STEP_TYPES:
+                step = str(event.get("text") or event.get("message") or "")
+                if step:
+                    break
+        last = self.events[-1].get("at", "") if self.events else ""
+        return _short(step, 200), last
+
+    def runtime_seconds(self) -> int | None:
+        started = _parse(self.started_at)
+        if started is None:
+            return None
+        end = _parse(self.finished_at) or datetime.now(timezone.utc)
+        return max(0, int((end - started).total_seconds()))
 
     def summary(self, *, task_chars: int = 300) -> dict[str, Any]:
         task = self.task if len(self.task) <= task_chars else self.task[:task_chars] + "…"
@@ -106,6 +166,11 @@ class Job:
             "finished_at": self.finished_at or None,
             "approval": self.pending_approval,
         }
+
+    def live(self) -> dict[str, Any]:
+        """Progress fields for a job that has not ended (computed, never stored)."""
+        step, last = self.last_step()
+        return {"runtime_seconds": self.runtime_seconds(), "last_step": step or None, "last_event_at": last or None}
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -205,8 +270,9 @@ class JobManager:
         self.store = store
         self.jobs: dict[str, Job] = {}
         self._slots = asyncio.Semaphore(settings.max_concurrent_jobs)
-        self._workspace_locks: dict[str, asyncio.Lock] = {}
-        self._session_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # ("workspace", name) or ("session", name, session) -> lock, and which job holds it.
+        self._locks: dict[tuple, asyncio.Lock] = {}
+        self._holders: dict[tuple, str] = {}
         self._restore()
 
     def _restore(self) -> None:
@@ -291,6 +357,11 @@ class JobManager:
         # Codex without CODEX_MODEL has no fixed default: the job shows the model once it has run.
         return model_for(engine) or ("" if engine == "codex" else self.settings.model)
 
+    def default_models(self) -> dict[str, str | None]:
+        """Every engine's model for jobs that do not name one (None: the engine decides, Codex without CODEX_MODEL)."""
+        engines = getattr(self.engine, "engines", None) or {"cursor": self.engine}
+        return {name: self.default_model(name) or None for name in engines}
+
     def submit(self, req: JobRequest) -> Job:
         job_id = uuid.uuid4().hex[:16]
         spec = self._build(req, job_id)
@@ -303,6 +374,7 @@ class JobManager:
             profile=spec.profile,
             origin=req.origin,
             engine=spec.engine,
+            spec=spec,
         )
         self.jobs[job.id] = job
         self.store.save(job)
@@ -332,6 +404,7 @@ class JobManager:
             return
         entry = {"seq": len(job.events) + 1, "at": _now(), **event}
         job.events.append(entry)
+        job.activity_clock = asyncio.get_running_loop().time()
         if not full or event.get("type") != "text":
             self.store.add_event(job.id, entry)
         job.changed.set()
@@ -353,28 +426,59 @@ class JobManager:
         job.changed.set()
         logger.info("job %s %s", job.id, status)
 
-    async def _run(self, job: Job, spec: RunSpec) -> None:
-        locks: list[asyncio.Lock] = []
+    def _lock_keys(self, spec: RunSpec) -> list[tuple]:
+        keys: list[tuple] = []
         if touches_files(spec.profile):
-            locks.append(self._workspace_locks.setdefault(spec.workspace, asyncio.Lock()))
+            keys.append(("workspace", spec.workspace))
         if spec.session:
-            locks.append(self._session_locks.setdefault((spec.workspace, spec.session), asyncio.Lock()))
-        acquired: list[asyncio.Lock] = []
+            keys.append(("session", spec.workspace, spec.session))
+        return keys
+
+    def _release(self, job: Job) -> None:
+        while job.held:
+            key = job.held.pop()
+            if self._holders.get(key) == job.id:
+                self._holders.pop(key, None)
+            self._locks[key].release()
+
+    async def _run(self, job: Job, spec: RunSpec) -> None:
+        loop = asyncio.get_running_loop()
         try:
+            # Locks before a slot: a job that waits for its workspace must not keep a job elsewhere from running.
+            for key in self._lock_keys(spec):
+                lock = self._locks.setdefault(key, asyncio.Lock())
+                if lock.locked():
+                    job.waiting_for, job.waiting_key = key[0], key
+                    holder = self._holders.get(key, "")
+                    where = "this workspace" if key[0] == "workspace" else "this session"
+                    await self._emit(
+                        job, {"type": "status", "text": f"Waiting for another job in {where} ({holder or '?'})..."}
+                    )
+                await lock.acquire()
+                job.held.append(key)
+                self._holders[key] = job.id
+            if self._slots.locked():
+                job.waiting_for, job.waiting_key = "slot", ()
+                await self._emit(
+                    job,
+                    {"type": "status", "text": f"Waiting for a free slot (MAX_CONCURRENT_JOBS={self.settings.max_concurrent_jobs})..."},
+                )
             async with self._slots:
-                for lock in locks:
-                    if lock.locked():
-                        await self._emit(job, {"type": "status", "text": "Waiting for another job in this workspace..."})
-                    await lock.acquire()
-                    acquired.append(lock)
+                job.waiting_for, job.waiting_key = "", ()
                 job.status = "running"
                 job.started_at = _now()
+                job.started_clock = job.activity_clock = loop.time()
                 self.store.save(job)
                 await self._emit(job, {"type": "status", "text": "Running"})
-                outcome = await asyncio.wait_for(
-                    self.engine.run(spec, lambda event: self._emit(job, event)),
-                    timeout=self.settings.job_timeout,
-                )
+                try:
+                    outcome = await self._supervise(job, spec)
+                except _Stopped:
+                    status, message = job.stop_status or "cancelled", job.stop_reason or "Cancelled."
+                    await self._emit(job, {"type": "error" if status == "failed" else "status", "message": message,
+                                           "text": message})
+                    self._finish(job, status, error=message)
+                    await self._cleanup(job, spec)
+                    return
             fields = dict(
                 result=outcome.text,
                 error=outcome.error,
@@ -393,11 +497,7 @@ class JobManager:
             self._finish(job, outcome.status, **fields)
         except asyncio.CancelledError:
             await self._emit(job, {"type": "status", "text": "Cancelled"})
-            self._finish(job, "cancelled", error=job.error or "Cancelled.")
-        except asyncio.TimeoutError:
-            message = f"The job ran longer than JOB_TIMEOUT_SECONDS ({self.settings.job_timeout}s) and was stopped."
-            await self._emit(job, {"type": "error", "message": message})
-            self._finish(job, "failed", error=message)
+            self._finish(job, "cancelled", error=job.stop_reason or job.error or "Cancelled.")
         except EngineError as exc:
             await self._emit(job, {"type": "error", "message": str(exc)})
             self._finish(job, "failed", error=str(exc))
@@ -407,8 +507,85 @@ class JobManager:
             await self._emit(job, {"type": "error", "message": message})
             self._finish(job, "failed", error=message)
         finally:
-            for lock in acquired:
-                lock.release()
+            job.waiting_for, job.waiting_key = "", ()
+            self._release(job)
+
+    def _overdue(self, job: Job, now: float) -> tuple[str, str] | None:
+        """(status, reason) when a watchdog limit is past, else None."""
+        settings = self.settings
+        if job.status == "needs_approval":
+            if job.approval_clock and now - job.approval_clock >= settings.approval_timeout:
+                return "cancelled", self._approval_timeout_reason(job)
+        elif settings.job_idle_timeout > 0 and now - job.activity_clock >= settings.job_idle_timeout:
+            return "failed", (
+                f"No output or progress from the engine for {settings.job_idle_timeout} s "
+                "(JOB_IDLE_TIMEOUT_SECONDS); the job was stopped."
+            )
+        if now - job.started_clock >= settings.job_timeout:
+            return "failed", f"The job ran longer than JOB_MAX_RUNTIME_SECONDS ({settings.job_timeout}s) and was stopped."
+        return None
+
+    def _approval_timeout_reason(self, job: Job) -> str:
+        approval = job.pending_approval or {}
+        what = f" for {approval.get('tool', 'ssh')} {approval.get('host', '')}".rstrip() if approval else ""
+        return f"approval timed out: no answer within {self.settings.approval_timeout} s{what} (APPROVAL_TIMEOUT_SECONDS)."
+
+    def _next_check(self, job: Job, now: float) -> float:
+        settings = self.settings
+        due = [job.started_clock + settings.job_timeout]
+        if job.status == "needs_approval" and job.approval_clock:
+            due.append(job.approval_clock + settings.approval_timeout)
+        elif settings.job_idle_timeout > 0:
+            due.append(job.activity_clock + settings.job_idle_timeout)
+        return min(_TICK, max(0.01, min(due) - now))
+
+    async def _supervise(self, job: Job, spec: RunSpec):
+        """Run the engine under the watchdogs. Returns its Outcome; raises _Stopped after a cancel or a limit."""
+        loop = asyncio.get_running_loop()
+        runner = asyncio.ensure_future(self.engine.run(spec, lambda event: self._emit(job, event)))
+        stopper = asyncio.ensure_future(job.stop.wait())
+        try:
+            while not job.stop.is_set():
+                late = self._overdue(job, loop.time())
+                if late is not None:
+                    self.request_stop(job, *late)
+                    break
+                await asyncio.wait({runner, stopper}, timeout=self._next_check(job, loop.time()),
+                                   return_when=asyncio.FIRST_COMPLETED)
+                if runner.done():
+                    return runner.result()
+            if runner.done():
+                return runner.result()
+            runner.cancel()
+            finished, _ = await asyncio.wait({runner}, timeout=STOP_GRACE)
+            if not finished:
+                logger.warning("job %s: engine did not stop within %ss, killing its processes", job.id, STOP_GRACE)
+            runner.add_done_callback(_swallow)
+            raise _Stopped()
+        except asyncio.CancelledError:
+            if not runner.done():
+                runner.cancel()
+                await asyncio.wait({runner}, timeout=STOP_GRACE)
+            runner.add_done_callback(_swallow)
+            raise
+        finally:
+            stopper.cancel()
+
+    async def _cleanup(self, job: Job, spec: RunSpec) -> None:
+        """After a stop: kill what the job left running. Its workspace lock is released right after."""
+        try:
+            await proctree.kill_tagged(JOB_ENV, job.id)
+            kill = getattr(self.engine, "kill", None)
+            # The Cursor bridge serves the whole workspace: leave it to a job of the same engine still running there.
+            shared = any(
+                other is not job and not other.done and other.started_at
+                and other.workspace == job.workspace and other.engine == job.engine
+                for other in self.jobs.values()
+            )
+            if callable(kill) and not shared:
+                await asyncio.wait_for(kill(spec), 15)
+        except Exception:
+            logger.warning("job %s: cleanup after stop failed", job.id, exc_info=True)
 
     # ---- read / control ----------------------------------------------------------------------
 
@@ -423,13 +600,93 @@ class JobManager:
             rows = [j for j in rows if j.status == status]
         return rows[: max(1, min(limit, 500))]
 
-    def cancel(self, job_id: str) -> Job | None:
+    def request_stop(self, job: Job, status: str, reason: str) -> bool:
+        """Ask a running job to stop; it ends as `status` with `reason` as its error. The first reason wins."""
+        if job.done or job.stop.is_set():
+            return False
+        job.stop_status, job.stop_reason = status, reason
+        if job.approval_future is not None and not job.approval_future.done():
+            job.approval_future.set_result((False, reason))
+        job.stop.set()
+        logger.info("job %s stopping: %s", job.id, reason)
+        return True
+
+    def cancel(self, job_id: str, reason: str = "Cancelled.") -> Job | None:
         job = self.jobs.get(job_id)
         if job is None:
             return None
-        if not job.done and job.task_handle is not None:
+        if job.done:
+            return job
+        if job.started_at:
+            self.request_stop(job, "cancelled", reason)
+        elif job.task_handle is not None:
+            job.stop_reason = job.stop_reason or reason
             job.task_handle.cancel()
         return job
+
+    def cancel_workspace(self, workspace: str, reason: str = "Cancelled.") -> list[Job]:
+        """Cancel every job in the workspace that has not ended (queued ones first, so none starts in between)."""
+        name = (workspace or "").strip().lower() or self.settings.default_workspace
+        pending = [j for j in self.jobs.values() if j.workspace == name and not j.done]
+        pending.sort(key=lambda j: (bool(j.started_at), j.created_at))
+        for job in pending:
+            self.cancel(job.id, reason)
+        return pending
+
+    def blocked_by(self, job: Job) -> str | None:
+        """The job holding the lock a queued job waits for."""
+        if job.status != "queued" or not job.waiting_key:
+            return None
+        return self._holders.get(job.waiting_key) or None
+
+    def describe(self, job: Job) -> dict[str, Any]:
+        """One row of agent_jobs / GET /jobs/overview: what runs where, for how long, waiting for what.
+        No secrets and no full prompt (a short preview of the task only)."""
+        step, last = job.last_step()
+        approval = job.pending_approval if job.status == "needs_approval" else None
+        row: dict[str, Any] = {
+            "job_id": job.id,
+            "status": job.status,
+            "workspace": job.workspace,
+            "engine": job.engine,
+            "model": job.model or None,
+            "session": job.session or None,
+            "tools": job.profile,
+            "origin": job.origin,
+            "task_preview": _short(job.task, 120),
+            "created_at": job.created_at,
+            "started_at": job.started_at or None,
+            "finished_at": job.finished_at or None,
+            "runtime_seconds": job.runtime_seconds(),
+            "last_step": step or None,
+            "last_event_at": last or None,
+            "waiting_for_approval": approval is not None,
+            "approval": {
+                "tool": approval.get("tool"),
+                "host": approval.get("host"),
+                "user": approval.get("user") or None,
+                "command": _short(approval.get("command") or "", 200) or None,
+                "requested_at": approval.get("requested_at"),
+            } if approval else None,
+            "waiting_for": (job.waiting_for or None) if job.status == "queued" else None,
+            "blocked_by": self.blocked_by(job),
+        }
+        if job.done and job.error:
+            row["error"] = _short(job.error, 300)
+        return row
+
+    def overview(self, workspace: str = "", status: str = "", finished: int = 20) -> list[Job]:
+        """Jobs that have not ended plus the last `finished` ones; or only the given statuses (comma-separated)."""
+        rows = sorted(self.jobs.values(), key=lambda j: j.created_at, reverse=True)
+        if workspace:
+            name = workspace.strip().lower()
+            rows = [j for j in rows if j.workspace == name]
+        wanted = {part.strip().lower() for part in (status or "").split(",") if part.strip()}
+        if wanted:
+            return [j for j in rows if j.status in wanted][:500]
+        active = [j for j in rows if not j.done]
+        ended = [j for j in rows if j.done][: max(0, min(finished, 500))]
+        return active + ended
 
     async def wait(self, job: Job, timeout: float, *, stop_on_approval: bool = False) -> Job:
         """Wait until the job ends (or asks for approval) or the timeout passes, whichever is first."""
@@ -515,21 +772,28 @@ class JobManager:
                 "command": command,
                 "requested_at": _now(),
             }
-            job.approval_future = asyncio.get_running_loop().create_future()
+            loop = asyncio.get_running_loop()
+            job.approval_future = loop.create_future()
             job.pending_approval = approval
+            job.approval_clock = loop.time()
             job.status = "needs_approval"
             self.store.save(job)
             await self._emit(job, {"type": "approval", **approval, "text": f"Approval needed: {label}"})
             logger.info("job %s waits for approval: %s", job.id, label)
             try:
                 allow, note = await asyncio.wait_for(
-                    asyncio.shield(job.approval_future), self.settings.ssh_approval_timeout
+                    asyncio.shield(job.approval_future), self.settings.approval_timeout
                 )
             except asyncio.TimeoutError:
-                allow, note = False, f"No answer within {self.settings.ssh_approval_timeout} s."
+                # Nobody answered: the whole job ends, it does not go on without the command.
+                note = self._approval_timeout_reason(job)
+                allow = False
+                self.request_stop(job, "cancelled", note)
             finally:
                 job.approval_future = None
                 job.pending_approval = None
+                job.approval_clock = 0.0
+                job.activity_clock = asyncio.get_running_loop().time()
                 if not job.done:
                     job.status = "running"
                     self.store.save(job)
@@ -572,3 +836,9 @@ class JobManager:
             handle.cancel()
         if running:
             await asyncio.gather(*running, return_exceptions=True)
+
+
+def _swallow(task: asyncio.Future) -> None:
+    """Retrieve the result of an engine task nobody waits for any more, so it is not logged as lost."""
+    if not task.cancelled():
+        task.exception()

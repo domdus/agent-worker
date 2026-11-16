@@ -94,7 +94,7 @@ async def test_timeout_fails_the_job(settings, engine):
     job = manager.submit(JobRequest(task="a"))
     await manager.wait(job, 5)
     assert job.status == "failed"
-    assert "JOB_TIMEOUT_SECONDS" in job.error
+    assert "JOB_MAX_RUNTIME_SECONDS" in job.error
 
 
 async def test_engine_error_fails_the_job(settings, engine):

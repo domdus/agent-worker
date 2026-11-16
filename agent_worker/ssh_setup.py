@@ -153,4 +153,4 @@ def prepare_environment(settings: Settings) -> None:
     if not path.startswith(str(BIN_DIR)):
         os.environ["PATH"] = f"{BIN_DIR}{os.pathsep}{path}" if path else str(BIN_DIR)
     os.environ["AGENT_WORKER_URL"] = f"http://127.0.0.1:{settings.port}"
-    os.environ["AGENT_WORKER_APPROVAL_TIMEOUT"] = str(settings.ssh_approval_timeout)
+    os.environ["AGENT_WORKER_APPROVAL_TIMEOUT"] = str(settings.approval_timeout)

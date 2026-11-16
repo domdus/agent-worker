@@ -72,14 +72,21 @@ class Settings:
     allow_request_mcp: bool = True
     create_workspaces: bool = True
     max_concurrent_jobs: int = 2
-    job_timeout: int = 1800
+    # Watchdogs. job_timeout: longest a job may run (JOB_MAX_RUNTIME_SECONDS). job_idle_timeout: longest
+    # a running job may go without engine output or progress (0 = off). approval_timeout: longest a job
+    # waits in needs_approval before it is cancelled ("approval timed out").
+    job_timeout: int = 3600
+    job_idle_timeout: int = 900
+    approval_timeout: int = 1800
     mcp_wait_seconds: int = 20
+    # Upper bound for every MCP wait (agent_run, agent_job, ...), kept below the usual client tool
+    # timeouts (often 30 s), so an answer with the job_id arrives before the client gives up.
+    mcp_max_wait: int = 25
     max_call_depth: int = 1
     keep_jobs: int = 200
     instructions: str = ""
     # Hosts (fnmatch patterns on the ssh alias or its HostName) where a job pauses for a human first.
     ssh_approval_hosts: tuple[str, ...] = ()
-    ssh_approval_timeout: int = 900
     # Let MCP callers approve with the agent_approve tool. Off: the calling model could approve itself.
     approval_tool: bool = False
     # Claude Code (claude-agent-sdk): a Claude Plan token (sk-ant-oat…, `claude setup-token`) or an
@@ -164,13 +171,17 @@ class Settings:
             allow_request_mcp=_bool("ALLOW_REQUEST_MCP", True),
             create_workspaces=_bool("CREATE_WORKSPACES", True),
             max_concurrent_jobs=_int("MAX_CONCURRENT_JOBS", 2, 1),
-            job_timeout=_int("JOB_TIMEOUT_SECONDS", 1800, 30),
+            # JOB_TIMEOUT_SECONDS is the name before 0.5.0.
+            job_timeout=_int("JOB_MAX_RUNTIME_SECONDS", _int("JOB_TIMEOUT_SECONDS", 3600, 30), 30),
+            job_idle_timeout=_int("JOB_IDLE_TIMEOUT_SECONDS", 900, 0),
+            # SSH_APPROVAL_TIMEOUT is the name before 0.5.0.
+            approval_timeout=_int("APPROVAL_TIMEOUT_SECONDS", _int("SSH_APPROVAL_TIMEOUT", 1800, 10), 10),
             mcp_wait_seconds=_int("MCP_WAIT_SECONDS", 20, 0),
+            mcp_max_wait=_int("MCP_MAX_WAIT_SECONDS", 25, 1),
             max_call_depth=_int("MAX_CALL_DEPTH", 1, 1),
             keep_jobs=_int("KEEP_JOBS", 200, 10),
             instructions=os.environ.get("WORKER_INSTRUCTIONS", "").strip(),
             ssh_approval_hosts=_patterns(os.environ.get("SSH_APPROVAL_HOSTS", "")),
-            ssh_approval_timeout=_int("SSH_APPROVAL_TIMEOUT", 900, 10),
             approval_tool=_bool("APPROVAL_TOOL", False),
             claude_oauth_token=os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip(),
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip(),
