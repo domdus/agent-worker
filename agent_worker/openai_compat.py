@@ -7,6 +7,11 @@ by the job's live events: answer text as delta.content, agent steps as delta.rea
 and Hermes show it as thinking; OPENAI_STEPS / X-Agent-Steps change or drop it), a keepalive comment
 while the agent is quiet, a usage chunk if stream_options.include_usage, then [DONE]. A failed job ends
 with an OpenAI error chunk before [DONE]. A client that goes away cancels the job.
+
+JSON mode: a request with response_format {"type": "json_schema"} or {"type": "json_object"} runs with tool
+profile "none" (no header can widen it), the agent is told to answer with only JSON (the schema included),
+and the answer is cleaned up (code fences stripped, else the first JSON object/array taken). No JSON in the
+answer is an OpenAI error (502), never prose. A stream is buffered and sends the JSON as one chunk.
 """
 
 from __future__ import annotations
@@ -140,6 +145,93 @@ def messages_to_request(messages: list[dict[str, Any]]) -> tuple[str, str, str, 
     if len(context) > _CONTEXT_CHARS:
         context = "…" + context[-_CONTEXT_CHARS:]
     return task, context, "\n\n".join(system), images
+
+
+# ---- JSON mode (response_format) ---------------------------------------------------------------
+
+JSON_FORMATS = ("json_schema", "json_object")
+
+
+def json_format(body: dict[str, Any]) -> dict[str, Any] | None:
+    """The request's response_format when it asks for JSON, else None (plain text, as before)."""
+    fmt = body.get("response_format")
+    if isinstance(fmt, dict) and fmt.get("type") in JSON_FORMATS:
+        return fmt
+    return None
+
+
+def json_instruction(fmt: dict[str, Any]) -> str:
+    """What the agent is told for a JSON-mode request: only the JSON value, no prose, no code fences."""
+    if fmt.get("type") == "json_schema":
+        spec = fmt.get("json_schema") if isinstance(fmt.get("json_schema"), dict) else {}
+        schema = spec.get("schema")
+        name = str(spec.get("name") or "").strip()
+        head = "Reply with ONLY a single JSON value that matches this JSON Schema"
+        head += f" (name: {name})" if name else ""
+        if schema is not None:
+            text = json.dumps(schema, ensure_ascii=False, indent=2)
+            head += ":\n\n" + text
+        else:
+            head = "Reply with ONLY a single valid JSON value"
+    else:
+        head = "Reply with ONLY a single JSON object"
+    return (
+        "OUTPUT FORMAT (mandatory): " + head + "\n\n"
+        "Your final answer is parsed by a program: output nothing but the JSON itself. No explanation, "
+        "no prose before or after it, no Markdown, no code fences (no ```)."
+    )
+
+
+def _strip_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        first_newline = text.find("\n")
+        # "```json\n...\n```" or "```\n...```"; a one-line "```{...}```" keeps everything after the ticks.
+        text = text[first_newline + 1 :] if first_newline >= 0 else text[3:]
+        text = text.rstrip()
+        if text.endswith("```"):
+            text = text[:-3]
+    return text.strip()
+
+
+def extract_json(text: str, object_only: bool = False) -> str | None:
+    """The answer as JSON text: the whole answer (fences stripped) if it parses, else the first balanced
+    top-level JSON object or array inside it. None if there is none (or, object_only, no JSON object)."""
+    cleaned = _strip_fences(str(text or ""))
+    try:
+        value = json.loads(cleaned)
+    except ValueError:
+        pass
+    else:
+        if not object_only or isinstance(value, dict):
+            return cleaned
+    decoder = json.JSONDecoder()
+    starts = "{" if object_only else "{["
+    for index, char in enumerate(cleaned):
+        if char not in starts:
+            continue
+        try:
+            value, end = decoder.raw_decode(cleaned, index)
+        except ValueError:
+            continue
+        if isinstance(value, (dict, list)) and (not object_only or isinstance(value, dict)):
+            return cleaned[index:end]
+    return None
+
+
+def json_answer(job: Job, fmt: dict[str, Any]) -> tuple[str | None, str, str]:
+    """(json_text, error_message, error_code) for a finished JSON-mode job; json_text None on error."""
+    if job.status == INPUT_REQUIRED:
+        return None, "The agent asked for an approval; JSON mode cannot answer it.", "approval_required"
+    if job.status == CANCELLED:
+        return None, job.error or "The job was cancelled.", "cancelled"
+    if job.status != COMPLETED:
+        return None, job.error or "The agent failed.", job.public_status()
+    found = extract_json(job.result, object_only=fmt.get("type") == "json_object")
+    if found is None:
+        logger.info("job %s: no valid JSON in the answer (%d chars)", job.id, len(job.result or ""))
+        return None, "The agent's answer contained no valid JSON for the requested response_format.", "invalid_json"
+    return found, "", ""
 
 
 # ---- OpenAI wire format ------------------------------------------------------------------------
@@ -325,6 +417,16 @@ async def chat_completions(request: Request):
         task, context, instructions, images = messages_to_request(body["messages"])
     except HTTPException as exc:
         return _error_response(exc.status_code, str(exc.detail))
+    fmt = json_format(body)
+    tools = request.headers.get("x-agent-tools", "").strip()
+    if fmt is not None:
+        # "none" is the narrowest profile: narrow_profile keeps it whatever the ceiling or X-Agent-Tools say.
+        tools = "none"
+        rule = json_instruction(fmt)
+        instructions = f"{instructions}\n\n{rule}".strip()
+        if session:
+            # A warm agent (resumed session) gets only the task, not the instructions: repeat the rule there.
+            task = f"{task}\n\n{rule}"
     try:
         resolved_ws = resolve(manager.settings, workspace, create=False)[0]
     except WorkspaceError:
@@ -345,7 +447,7 @@ async def chat_completions(request: Request):
                 session=session,
                 model=model,
                 effort=str(body.get("reasoning_effort") or ""),
-                tools=request.headers.get("x-agent-tools", "").strip(),
+                tools=tools,
                 images=images,
                 context=context,
                 instructions=instructions,
@@ -417,6 +519,10 @@ async def _respond(request: Request, manager: JobManager, body: dict, job: Job, 
     cid = f"chatcmpl-{job.id}"
     shown = str(body.get("model") or job.model)
 
+    fmt = json_format(body)
+    if fmt is not None:
+        return await _respond_json(request, manager, body, job, fmt, cid, shown)
+
     if not body.get("stream"):
         if not await _wait_or_leave(request, manager, job):
             return _error_response(499, "The client closed the request; the job was cancelled.", "agent_cancelled")
@@ -428,3 +534,72 @@ async def _respond(request: Request, manager: JobManager, body: dict, job: Job, 
     steps = steps_mode(request.headers.get("x-agent-steps")) or manager.settings.openai_steps
     out = ChunkWriter(cid, shown, _include_usage(body))
     return _sse_response(sse_reply(manager, job, out, after=after, steps=steps, disconnected=request.is_disconnected))
+
+
+async def _respond_json(request: Request, manager: JobManager, body: dict, job: Job, fmt: dict, cid: str,
+                        shown: str):
+    """JSON mode: wait for the whole answer, then send only the JSON (or an OpenAI error)."""
+    extra = {"agent_worker": {"job_id": job.id, "status": job.public_status(), "changes": job.changes}}
+    if not body.get("stream"):
+        if not await _wait_or_leave(request, manager, job):
+            return _error_response(499, "The client closed the request; the job was cancelled.", "agent_cancelled")
+        if not job.done and job.status != INPUT_REQUIRED:
+            manager.cancel(job.id)
+            return _error_response(504, "The agent did not finish in time.", "server_error", "timeout")
+        text, message, code = json_answer(job, fmt)
+        if job.status == INPUT_REQUIRED:
+            manager.cancel(job.id, "JSON mode cannot answer an approval.")
+        if text is None:
+            return _error_response(502, message, "agent_error", code)
+        extra["agent_worker"]["status"] = job.public_status()
+        return _completion(cid, shown, text, _usage(job), extra)
+
+    steps = steps_mode(request.headers.get("x-agent-steps")) or manager.settings.openai_steps
+    out = ChunkWriter(cid, shown, _include_usage(body))
+    return _sse_response(sse_json_reply(manager, job, out, fmt, steps=steps, disconnected=request.is_disconnected))
+
+
+async def sse_json_reply(
+    manager: JobManager,
+    job: Job,
+    out: ChunkWriter,
+    fmt: dict[str, Any],
+    *,
+    steps: str = "reasoning_content",
+    disconnected: Callable[[], Awaitable[bool]] | None = None,
+) -> AsyncIterator[str]:
+    """JSON mode as a stream: steps live (as reasoning), the answer's text held back; once the job ends,
+    one content chunk with the JSON, or an error chunk. A stream that ends early cancels the job."""
+    finished = False
+    try:
+        yield out.chunk({"role": "assistant", "content": ""})
+        last_step = ""
+        async for event in manager.follow(job, 0, ping=KEEPALIVE_SECONDS):
+            if disconnected is not None and await disconnected():
+                return
+            kind = event.get("type")
+            if kind == "approval":
+                break
+            if kind in {"tool", "status"} and steps != "none":
+                line = str(event.get("text") or "").strip()
+                if line and line != last_step:
+                    last_step = line
+                    yield out.chunk({steps: line + "\n"})
+            elif kind == "ping":
+                yield out.keepalive()
+        if not job.done and job.status != INPUT_REQUIRED:
+            return
+        text, message, code = json_answer(job, fmt)
+        if text is None:
+            yield out.error(message, "agent_error", code)
+            yield out.done()
+        else:
+            yield out.chunk({"content": text})
+            for line in out.finish(_usage(job)):
+                yield line
+        finished = True
+    finally:
+        if not job.done:
+            # Ended early (client gone) or an approval JSON mode cannot answer: no job is left waiting.
+            logger.info("job %s: the JSON chat stream ended before the job (finished=%s), cancelling", job.id, finished)
+            manager.cancel(job.id)

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.1 (2026-11-19)
+
+OpenAI-compatible endpoint: JSON mode for `response_format`.
+
+### Added
+
+- `/v1/chat/completions` honours `response_format` `{"type": "json_schema", ...}` and `{"type": "json_object"}`:
+  - the job runs with tool profile `none`, whatever `TOOL_PROFILE` is; `X-Agent-Tools` cannot widen it;
+  - the agent is told (system level, with the schema) to answer with only the JSON, no prose and no code fences; with a session id the rule is also added to the task, since a resumed agent does not see the instructions again;
+  - the answer is cleaned up: surrounding whitespace and `` ``` ``/`` ```json `` fences are stripped; if it still is not JSON, the first balanced JSON object or array in it is used (`json_object`: objects only);
+  - no valid JSON, a failed or cancelled job is an OpenAI error object with HTTP 502 (`code` `invalid_json`, or the job's status), never prose;
+  - `stream: true` holds back the answer's text (steps still stream as reasoning) and sends the JSON as one chunk, or an error chunk.
+- Requests without `response_format` (or with `{"type": "text"}`) behave as before. The schema is not validated against the answer.
+
 ## 0.5.0 (2026-11-16)
 
 Job visibility, cancel that frees the workspace, watchdogs; job handling aligned with MCP (cancellation, Task statuses, conversation id in `_meta`).

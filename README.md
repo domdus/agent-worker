@@ -134,6 +134,7 @@ Any client that speaks OpenAI Chat Completions works with the same settings: bas
 - **One agent per chat:** the worker takes the chat's id from `X-OpenWebUI-Chat-Id`, `X-Session-Id`, `X-Agent-Session`, `X-Conversation-Id` or `X-Chat-Id`, or from `session_id`, `conversation_id` or `chat_id` in the body (also inside `metadata`). Placeholders such as `new` or an unfilled `{{...}}` template are ignored.
 - **Stop:** when the client closes the request (stop button, timeout), the job is cancelled, with and without streaming.
 - **Errors** come as OpenAI error objects (`{"error": {"message", "type", "code"}}`), so clients show the reason, for example a wrong API key.
+- **JSON mode:** with `response_format` `{"type": "json_schema", "json_schema": {"schema": …}}` or `{"type": "json_object"}` the job runs with tool profile `none` (`X-Agent-Tools` cannot widen it), the agent is told to answer with only JSON matching the schema, and `message.content` is just that JSON: code fences are stripped, and otherwise the first JSON object or array in the answer is taken. No JSON is an error (HTTP 502, `code: "invalid_json"`), never prose. With `"stream": true` the JSON is sent as one chunk at the end. The answer is not validated against the schema.
 
 ### Home Assistant AI Workspace
 
