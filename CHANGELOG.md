@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 (2026-11-20)
 
-Engine fallback chain.
+Engine fallback chain. Also the first published release with the JSON mode of 0.5.1 (0.5.1 was not released on its own).
 
 ### Added
 
@@ -12,6 +12,11 @@ Engine fallback chain.
 - No engine left: the job waits as `queued` (`waiting_for: "engine"`), gives its slot back and resumes at the known reset time or when an engine is signed in.
 - Promotion back up only at a job's start: `FALLBACK_PROMOTE` (`turn` default, `reset`, `off`), `FALLBACK_BACKOFF` (5m,15m,60m) for failures without a reset time, `FALLBACK_LOCK_SECONDS` (120) against flapping; the probe is the sign-in status, no model prompt. Blocks persist in `/data/fallback-state.json`.
 - Engines report structured error codes (`Outcome.error_kind`, `EngineError.kind`) and tool details/output for the in-memory handoff journal (never stored with the events).
+
+### Upgrade notes
+
+- Image: `ghcr.io/domdus/agent-worker:0.6.0` (or `:latest`): `docker compose pull && docker compose up -d --no-build` in the compose project dir with the existing `.env`.
+- Nothing changes without `FALLBACK_ENGINES`. To turn the chain on, set e.g. `FALLBACK_ENGINES=claude,cursor,codex` in `.env` (optional: `FALLBACK_PROMOTE`, `FALLBACK_BACKOFF`, `FALLBACK_LOCK_SECONDS`) and recreate the container. Every engine in the chain needs its own sign-in.
 
 ## 0.5.1 (2026-11-19)
 
