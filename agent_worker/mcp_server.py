@@ -157,6 +157,11 @@ def job_payload(
             out["changes"] = job.changes
         if job.usage:
             out["usage"] = job.usage
+        if job.attempts:
+            # Engine fallback: which engines ran it, and why each one stopped.
+            out["engines_used"] = job.engines_used()
+            if len(job.attempts) > 1:
+                out["fallback"] = job.attempts
     else:
         out["hint"] = "Still running. Call agent_job with this job_id to wait for the result."
         out.update(job.live())
@@ -198,6 +203,13 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
 
     server = MCPServer(name="agent-worker", instructions=INSTRUCTIONS)
     engines_note = _engines_note(manager.engine)
+    if manager.fallback_on:
+        chain = " -> ".join(name for name, _ in settings.fallback_engines)
+        engines_note += (
+            f" Fallback chain: {chain}. On a provider failure (plan limit, 429, expired sign-in, outage) the same "
+            "job goes on with the next engine below the one it started on (engines_used in the result); with "
+            "no engine left it waits (queued) and resumes on its own."
+        )
 
     async def _progress(ctx: Context | None, job: Job) -> None:
         if ctx is None:

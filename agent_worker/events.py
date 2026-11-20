@@ -74,11 +74,62 @@ def _call_id(message: Any, block: Any = None) -> str:
     return str(_get(message, "call_id") or _get(message, "callId") or "")
 
 
-def _tool_event(name: str, phase: str, text: str, call_id: str = "") -> dict[str, str]:
-    event = {"type": "tool", "name": name, "phase": phase, "text": text}
+def _tool_event(name: str, phase: str, text: str, call_id: str = "", *, detail: str = "", output: str = "",
+                failed: bool = False) -> dict[str, Any]:
+    event: dict[str, Any] = {"type": "tool", "name": name, "phase": phase, "text": text}
     if call_id:
         event["id"] = call_id
+    # detail (what the call does) and output (what it returned) only feed the job's in-memory journal for an
+    # engine handoff; the job manager takes them out before the event is stored or streamed.
+    if detail:
+        event["detail"] = detail
+    if output:
+        event["output"] = output
+    if failed:
+        event["failed"] = True
     return event
+
+
+_DETAIL_KEYS = ("command", "cmd", "file_path", "path", "notebook_path", "url", "query", "pattern", "host")
+
+
+def tool_detail(payload: Any, limit: int = 400) -> str:
+    """A short line of what a tool call does: its command, file, URL or query (else its arguments)."""
+    data = _mapping(payload)
+    if not data:
+        return ""
+    for key in ("arguments", "args", "input", "params"):
+        inner = _mapping(data.get(key))
+        if inner:
+            data = {**inner, **{k: v for k, v in data.items() if k in _DETAIL_KEYS}}
+            break
+    parts = []
+    for key in _DETAIL_KEYS:
+        value = data.get(key)
+        if isinstance(value, (list, tuple)):
+            value = " ".join(str(v) for v in value)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            parts.append(f"{key}={str(value).strip()}" if key not in {"command", "cmd"} else str(value).strip())
+    if not parts:
+        try:
+            raw = json.dumps(data, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            raw = str(data)
+        parts = [raw]
+    text = " ".join(" ".join(parts).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def tool_output(value: Any, limit: int = 600) -> str:
+    """A tool result as short text (content blocks, dicts or plain strings)."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        value = " ".join(str(_get(item, "text") or "") if not isinstance(item, str) else item for item in value)
+    elif not isinstance(value, str):
+        value = _get(value, "text") or _get(value, "output") or _get(value, "result") or value
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def map_sdk_message(message: Any) -> list[dict[str, str]]:
@@ -99,7 +150,8 @@ def map_sdk_message(message: Any) -> list[dict[str, str]]:
                 )
                 label = _tool_label(name)
                 events.append(
-                    _tool_event(name, "start", f"Calling {label}...", _call_id(message, block))
+                    _tool_event(name, "start", f"Calling {label}...", _call_id(message, block),
+                                detail=tool_detail(_get(block, "input")))
                 )
         return events
     if kind == "thinking":
@@ -113,11 +165,13 @@ def map_sdk_message(message: Any) -> list[dict[str, str]]:
         label = _tool_label(name)
         status = str(_get(message, "status") or "")
         call_id = _call_id(message)
+        output = tool_output(_get(message, "result"))
         if status == "completed":
-            return [_tool_event(name, "end", f"Finished {label}", call_id)]
+            return [_tool_event(name, "end", f"Finished {label}", call_id, output=output)]
         if status == "error":
-            return [_tool_event(name, "end", f"{label} failed", call_id)]
-        return [_tool_event(name, "start", f"Calling {label}...", call_id)]
+            return [_tool_event(name, "end", f"{label} failed", call_id, output=output, failed=True)]
+        detail = tool_detail(_get(message, "args")) or tool_detail(_get(message, "input"))
+        return [_tool_event(name, "start", f"Calling {label}...", call_id, detail=detail)]
     if kind == "status":
         text = str(_get(message, "message") or _get(message, "status") or "Working...")
         if text.upper() == "ERROR":

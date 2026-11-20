@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+Engine fallback chain.
+
+### Added
+
+- `FALLBACK_ENGINES` (e.g. `claude,cursor,codex:gpt-5.5`): on a provider-side failure (plan/usage limit, 429, expired or missing sign-in, timeout, connection error, 5xx/overloaded) the job goes on with the next engine of the chain under the same `job_id`, with a handoff (original task, the session's conversation, a journal of executed tool calls with results, the workspace state, and the instruction not to repeat side effects). Never on a cancel, watchdog, refused approval, refusal, tool error or invalid input. Engines that are not signed in are skipped. Empty = off, nothing changes.
+- An explicit `engine` stays the starting point; the chain goes on below it.
+- Switches are steps (`claude am Limit (Reset 18:30) – cursor übernimmt`), also in `/v1` streams as thinking; results carry `engines_used` and `fallback`; `GET /health` → `fallback`.
+- No engine left: the job waits as `queued` (`waiting_for: "engine"`), gives its slot back and resumes at the known reset time or when an engine is signed in.
+- Promotion back up only at a job's start: `FALLBACK_PROMOTE` (`turn` default, `reset`, `off`), `FALLBACK_BACKOFF` (5m,15m,60m) for failures without a reset time, `FALLBACK_LOCK_SECONDS` (120) against flapping; the probe is the sign-in status, no model prompt. Blocks persist in `/data/fallback-state.json`.
+- Engines report structured error codes (`Outcome.error_kind`, `EngineError.kind`) and tool details/output for the in-memory handoff journal (never stored with the events).
+
 ## 0.5.1 (2026-11-19)
 
 OpenAI-compatible endpoint: JSON mode for `response_format`.

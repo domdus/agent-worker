@@ -259,6 +259,12 @@ def session_of(request: Request, body: dict[str, Any]) -> str:
     return ""
 
 
+def _engines(job: Job) -> dict[str, Any]:
+    """Engine fallback: which engines ran the job (only when there was a chain to walk)."""
+    used = job.engines_used()
+    return {"engines_used": used} if job.attempts and used else {}
+
+
 def _usage(job: Job) -> dict[str, int]:
     usage = job.usage or {}
     prompt = int(usage.get("prompt_tokens") or 0)
@@ -529,7 +535,8 @@ async def _respond(request: Request, manager: JobManager, body: dict, job: Job, 
         if job.status == INPUT_REQUIRED:
             return _reply(body, job, (job.result or "") + approval_prompt(job))
         return _completion(cid, shown, _answer(job), _usage(job),
-                           {"agent_worker": {"job_id": job.id, "status": job.public_status(), "changes": job.changes}})
+                           {"agent_worker": {"job_id": job.id, "status": job.public_status(), "changes": job.changes,
+                                             **_engines(job)}})
 
     steps = steps_mode(request.headers.get("x-agent-steps")) or manager.settings.openai_steps
     out = ChunkWriter(cid, shown, _include_usage(body))
@@ -552,6 +559,7 @@ async def _respond_json(request: Request, manager: JobManager, body: dict, job: 
         if text is None:
             return _error_response(502, message, "agent_error", code)
         extra["agent_worker"]["status"] = job.public_status()
+        extra["agent_worker"].update(_engines(job))
         return _completion(cid, shown, text, _usage(job), extra)
 
     steps = steps_mode(request.headers.get("x-agent-steps")) or manager.settings.openai_steps
