@@ -35,7 +35,7 @@ CURSOR_MODEL=composer-2.5
 ```yaml
 services:
   agent-worker:
-    image: ghcr.io/domdus/agent-worker:latest   # or pin a version, e.g. :0.5.0
+    image: ghcr.io/domdus/agent-worker:latest   # or pin a version, e.g. :0.6.0
     container_name: agent-worker
     env_file: .env
     ports:
@@ -134,6 +134,7 @@ Any client that speaks OpenAI Chat Completions works with the same settings: bas
 - **One agent per chat:** the worker takes the chat's id from `X-OpenWebUI-Chat-Id`, `X-Session-Id`, `X-Agent-Session`, `X-Conversation-Id` or `X-Chat-Id`, or from `session_id`, `conversation_id` or `chat_id` in the body (also inside `metadata`). Placeholders such as `new` or an unfilled `{{...}}` template are ignored.
 - **Stop:** when the client closes the request (stop button, timeout), the job is cancelled, with and without streaming.
 - **Errors** come as OpenAI error objects (`{"error": {"message", "type", "code"}}`), so clients show the reason, for example a wrong API key.
+- **JSON mode:** with `response_format` `{"type": "json_schema", "json_schema": {"schema": …}}` or `{"type": "json_object"}` the job runs with tool profile `none` (`X-Agent-Tools` cannot widen it), the agent is told to answer with only JSON matching the schema, and `message.content` is just that JSON: code fences are stripped, and otherwise the first JSON object or array in the answer is taken. No JSON is an error (HTTP 502, `code: "invalid_json"`), never prose. With `"stream": true` the JSON is sent as one chunk at the end. The answer is not validated against the schema.
 
 ### Home Assistant AI Workspace
 
@@ -181,7 +182,7 @@ Anthropic's terms for the Agent SDK say third-party products should use API keys
 - **Jobs:** `"engine": "claude"`, `"codex"` (or `"cursor"`) in `POST /jobs`.
 - **MCP:** the `engine` argument of `agent_run`.
 - **`/v1`:** Claude models are listed as `claude-code/claude-sonnet-5-5` and so on, and `claude-code/<model>@workspace` works like the Cursor names. Cursor's own Claude models (for example `claude-4.5-sonnet`) still run on Cursor. Codex models are listed as `codex/<model>` (`codex` alone means Codex's default model); `codex/<model>@workspace` works too.
-- Without one, `DEFAULT_ENGINE` (`cursor`, `claude` or `codex`) is used, else Cursor, else the first other engine that is set up.
+- Without one, `DEFAULT_ENGINE` (`cursor`, `claude` or `codex`) is used, else Cursor, else the first other engine that is set up. With `FALLBACK_ENGINES`, a job without engine and model starts at the top of the chain (see [Engine fallback chain](#engine-fallback-chain)).
 
 `CLAUDE_MODEL` (default `claude-sonnet-5-5`) is the model when a Claude job names none. The tool profiles mean the same as for Cursor: `full` has files, the shell and the web; `local` has no web search or fetch; `offline` has no shell either; `mcp` has only MCP tools; `none` is chat only. Effort `fast`, `high` and `high_fast` become Claude Code's low, high and medium effort. A `session` resumes the Claude Code conversation; its state is kept in `/data/claude/config`.
 
@@ -383,6 +384,37 @@ What runs at the same time, as the code does it (`agent_worker/jobs.py`):
 - A job takes its workspace (and session) lock before a slot. A job that only waits for its workspace never takes a slot from a job in another workspace. (Before 0.5.0 it did: two jobs in one workspace could block a third workspace with the default of 2 slots.)
 - Cursor runs one bridge process per workspace and Claude Code and Codex one process per job, but this does not change the rules above.
 
+## Engine fallback chain
+
+Off by default. With `FALLBACK_ENGINES` set, a job that fails on the provider side goes on with the next engine of the chain, as the same job (same `job_id`); it does not fail.
+
+```env
+FALLBACK_ENGINES=claude,cursor,codex:gpt-5.5   # order of preference; engine:model picks a model for that engine
+FALLBACK_PROMOTE=turn                          # turn (default) | reset | off
+FALLBACK_BACKOFF=5m,15m,60m                    # optional: steps for failures without a known reset time
+FALLBACK_LOCK_SECONDS=120                      # optional: anti-flapping lock
+```
+
+**Where a job starts.** A job that names no engine and no model starts at the top of the chain. An explicit `engine` (`agent_run`, `POST /jobs`, a `/v1` model like `codex/gpt-5.5`) stays the starting point; the chain goes on *below* it (all of the chain when that engine is not part of it). A model without an engine (`/v1` `composer-2.5`) starts on `DEFAULT_ENGINE` as before. Engines further down run with the model from `engine:model`, else their own default (`CURSOR_MODEL`, `CLAUDE_MODEL`, `CODEX_MODEL`).
+
+**When it switches.** Only on provider-side failures: a plan, usage or token limit (with its reset time when the provider names one), 429, an expired, invalid or missing credential, timeouts, connection errors, 5xx and "overloaded". Never on a cancel, a watchdog stop, a refused approval, a refusal or other answer of the model, tool errors or invalid input (bad request, unknown model, context too long): those end the job as before. One classifier decides (`agent_worker/fallback.py`, `classify`); it reads the engines' structured error codes first (Claude Code: `rate_limit`, `billing_error`, `authentication_failed`, …; Codex: `usageLimitExceeded`, `unauthorized`, …), then the error text. Engines that are not signed in (`auth_status` `ready: false`) are skipped.
+
+**Handoff.** Sessions do not carry over between engines. The engine that takes over gets the original task, the conversation of the session so far, a journal of the tool calls and commands already executed (with their results, as far as the engine reported them), the workspace's uncommitted files and new commits, and the partial answer, with the explicit instruction not to repeat side-effecting steps (file writes, commits, pushes, ssh commands, deployments) but to check the state and go on. The journal is kept in memory only; tool output never goes into the stored events.
+
+**Visibility.** Each switch is a step, so `status_message` / `last_step` show it, e.g. `claude am Limit (Reset 18:30) – cursor übernimmt`, and `/v1` streams show it as a thinking line (`reasoning_content`). The result has `engines_used` (e.g. `["claude", "cursor"]`) and `fallback` (every try: engine, model, status `handed_off` / `skipped` / `completed` / `failed`, reason); `/v1` answers have `agent_worker.engines_used`. A last step `Engines: claude → cursor` is added when more than one ran. `GET /health` → `fallback` shows the chain and which engines are blocked until when.
+
+**No engine left.** The job goes to `queued` with `waiting_for: "engine"` and a message like `Keine Engine frei (claude am Limit (Reset 18:30); cursor nicht angemeldet) – Job wartet und geht um 18:30 automatisch weiter`. It gives its `MAX_CONCURRENT_JOBS` slot back (it keeps its workspace lock), looks again at the known reset time or every 60 s (an engine may get signed in), and then goes on from the top of the chain. Waiting does not count towards `JOB_MAX_RUNTIME_SECONDS`. A cancel ends it as usual.
+
+**Back up to the preferred engine (promotion).** Only at the start of a job (a turn), never in the middle of a run, and always from the top of the chain. A blocked engine is not tried before its known reset time; failures without one (connection errors, 5xx, 429 without a time, auth) block it for the next `FALLBACK_BACKOFF` step (every failure in a row takes the next step; a success clears it). The probe is cheap: the engine's sign-in status, no model prompt. A new sign-in (`/auth/...`) lifts an auth block at once. `FALLBACK_LOCK_SECONDS` is the shortest block, and a session that just switched stays put that long (no flapping). An engine that comes back for a session gets the session's conversation, since its own session there is stale.
+
+| `FALLBACK_PROMOTE` | A session that fell back … |
+| --- | --- |
+| `turn` (default) | goes back up at its next turn once the preferred engine's block is over. |
+| `reset` | goes back up only after a known reset time; without one, after the longest backoff step. |
+| `off` | stays on the engine that took over (new sessions and jobs without a session still start at the top). |
+
+Blocks are kept in `/data/fallback-state.json`, so a known reset time survives a restart. A job that was waiting for an engine when the worker restarted ends as `failed` ("The worker restarted …"), like every running job.
+
 ## Watchdogs and cancel
 
 No job blocks a workspace forever. Every running job is watched:
@@ -409,7 +441,7 @@ Job handling follows MCP where MCP has a standard for it. The tools `agent_run`,
 
 | `status` | MCP Task status | Before 0.5.0 (`legacy_status`) | Meaning |
 | --- | --- | --- | --- |
-| `queued` | `working` | `queued` | Waits for its workspace, its session or a free slot. `status_message` says which, and which job blocks it. |
+| `queued` | `working` | `queued` | Waits for its workspace, its session or a free slot, or (engine fallback) for an engine to become available. `status_message` says which, and which job blocks it. |
 | `working` | `working` | `running` | The engine runs. `status_message` is the last step. |
 | `input_required` | `input_required` | `needs_approval` | Paused for a human: `status_message` names what is awaited, e.g. "waiting for a human to approve ssh on root@prod: uptime". |
 | `completed` | `completed` | `succeeded` | Ended with an answer. |
@@ -598,7 +630,7 @@ The guard sees what the agent runs with the normal commands. It is a guardrail f
 
 ## Configuration
 
-See [.env.example](.env.example). The most important settings: `CURSOR_API_KEY`, `WORKER_TOKEN`, `CURSOR_MODEL`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `OPENAI_API_KEY`, `CODEX_MODEL`, `CODEX_AUTH_JSON`, `CODEX_SANDBOX`, `CODEX_CONFIG`, `DEFAULT_ENGINE`, `TOOL_PROFILE`, `MAX_CONCURRENT_JOBS` (2), `JOB_MAX_RUNTIME_SECONDS` (3600), `JOB_IDLE_TIMEOUT_SECONDS` (900), `APPROVAL_TIMEOUT_SECONDS` (1800), `MCP_WAIT_SECONDS` (20), `MCP_MAX_WAIT_SECONDS` (25), `MCP_CANCEL_ON_CANCELLED` (true), `MCP_CANCEL_ON_DISCONNECT` (true), `JOB_STATUS_NAMES` (mcp), `TASK_POLL_INTERVAL_MS` (5000), `WORKSPACE_DIR`, `GIT_REPO`, `SSH_KEY`, `SSH_KEYS_DIR`, `SSH_CONFIG`, `SSH_KNOWN_HOSTS`, `SSH_APPROVAL_HOSTS`, `APPROVAL_TOOL`, `WORKER_INSTRUCTIONS`, `REWRITE_LOOPBACK_HOST`.
+See [.env.example](.env.example). The most important settings: `CURSOR_API_KEY`, `WORKER_TOKEN`, `CURSOR_MODEL`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `OPENAI_API_KEY`, `CODEX_MODEL`, `CODEX_AUTH_JSON`, `CODEX_SANDBOX`, `CODEX_CONFIG`, `DEFAULT_ENGINE`, `FALLBACK_ENGINES`, `FALLBACK_PROMOTE` (turn), `FALLBACK_BACKOFF` (5m,15m,60m), `FALLBACK_LOCK_SECONDS` (120), `TOOL_PROFILE`, `MAX_CONCURRENT_JOBS` (2), `JOB_MAX_RUNTIME_SECONDS` (3600), `JOB_IDLE_TIMEOUT_SECONDS` (900), `APPROVAL_TIMEOUT_SECONDS` (1800), `MCP_WAIT_SECONDS` (20), `MCP_MAX_WAIT_SECONDS` (25), `MCP_CANCEL_ON_CANCELLED` (true), `MCP_CANCEL_ON_DISCONNECT` (true), `JOB_STATUS_NAMES` (mcp), `TASK_POLL_INTERVAL_MS` (5000), `WORKSPACE_DIR`, `GIT_REPO`, `SSH_KEY`, `SSH_KEYS_DIR`, `SSH_CONFIG`, `SSH_KNOWN_HOSTS`, `SSH_APPROVAL_HOSTS`, `APPROVAL_TOOL`, `WORKER_INSTRUCTIONS`, `REWRITE_LOOPBACK_HOST`.
 
 ## Development
 

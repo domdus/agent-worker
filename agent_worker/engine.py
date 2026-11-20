@@ -44,7 +44,12 @@ JOB_ENV = "AGENT_WORKER_JOB"
 
 
 class EngineError(RuntimeError):
-    pass
+    """An engine could not run the job. `kind`: a structured error code when the engine knows one
+    (see agent_worker.fallback.classify)."""
+
+    def __init__(self, message: str = "", kind: str = "") -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 @dataclass
@@ -78,6 +83,9 @@ class Outcome:
     usage: dict[str, Any] | None = None
     changes: dict[str, Any] | None = None
     duration_ms: int | None = None
+    # Structured error code of a failed run (Claude Code: rate_limit, billing_error, ...; Codex:
+    # usageLimitExceeded, ...), for the fallback classifier.
+    error_kind: str = ""
 
 
 class Engine(Protocol):

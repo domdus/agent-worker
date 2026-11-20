@@ -33,7 +33,7 @@ from agent_worker.engine import (
     git_changes,
     git_head,
 )
-from agent_worker.events import _resolved_tool_name, _tool_event, _tool_label
+from agent_worker.events import _resolved_tool_name, _tool_event, _tool_label, tool_detail, tool_output
 from agent_worker.redact import redact
 from agent_worker.settings import Settings
 
@@ -177,12 +177,15 @@ def map_message(message: Any) -> list[dict[str, Any]]:
                 events.append({"type": "status", "text": "Thinking..."})
             elif isinstance(block, ToolUseBlock):
                 name = _resolved_tool_name(block.name, block.input)
-                events.append(_tool_event(name, "start", f"Calling {_tool_label(name)}...", block.id))
+                events.append(_tool_event(name, "start", f"Calling {_tool_label(name)}...", block.id,
+                                          detail=tool_detail(block.input)))
     elif isinstance(message, UserMessage):
         for block in message.content if isinstance(message.content, list) else []:
             if isinstance(block, ToolResultBlock):
-                text = "Tool failed" if getattr(block, "is_error", False) else "Finished"
-                events.append(_tool_event("tool", "end", text, block.tool_use_id))
+                failed = bool(getattr(block, "is_error", False))
+                text = "Tool failed" if failed else "Finished"
+                events.append(_tool_event("tool", "end", text, block.tool_use_id,
+                                          output=tool_output(getattr(block, "content", None)), failed=failed))
     return events
 
 
@@ -426,6 +429,7 @@ class ClaudeEngine:
             error = API_ERRORS.get(turn.api_error) or redact(str(result.result or ""), [cred]).strip()
             return Outcome(
                 status="failed",
+                error_kind=turn.api_error,
                 error=(error or "Claude stopped without an answer.")[:400],
                 text="".join(turn.parts).strip(),
                 run_id=session_id,

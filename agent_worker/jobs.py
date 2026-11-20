@@ -15,14 +15,15 @@ import logging
 import sqlite3
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from agent_worker import fallback as fb
 from agent_worker import proctree
 from agent_worker import tasks as st
-from agent_worker.engine import JOB_ENV, Engine, EngineError, RunSpec
+from agent_worker.engine import JOB_ENV, Engine, EngineError, Outcome, RunSpec, git_changes, git_head
 from agent_worker.mcp_config import McpConfigError, load_mcp_servers, servers_from_request, with_depth
 from agent_worker.settings import Settings, narrow_profile, touches_files
 from agent_worker.workspaces import WorkspaceError, resolve
@@ -40,6 +41,11 @@ STOP_GRACE = 10.0
 # Longest the watchdog sleeps between checks.
 _TICK = 5.0
 _STEP_TYPES = frozenset({"tool", "status", "error", "approval"})
+# Event fields that only feed the in-memory handoff journal: never stored, streamed or listed.
+_JOURNAL_ONLY = ("detail", "output", "failed")
+# Earlier turns of a session handed to an engine that takes over (count, characters per field).
+_HISTORY_TURNS = 10
+_HISTORY_CHARS = 2000
 
 
 class JobError(ValueError):
@@ -64,6 +70,34 @@ def _parse(stamp: str) -> datetime | None:
 def _short(text: str, limit: int) -> str:
     flat = " ".join(str(text or "").split())
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def _clip(text: str, limit: int) -> str:
+    text = str(text or "").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def fb_stamp(stamp: str) -> float | None:
+    parsed = _parse(stamp)
+    return parsed.timestamp() if parsed is not None else None
+
+
+class _Slot:
+    """One MAX_CONCURRENT_JOBS slot that a job can give back while it waits for an engine, and take again."""
+
+    def __init__(self, semaphore: asyncio.Semaphore) -> None:
+        self._semaphore = semaphore
+        self.held = False
+
+    async def acquire(self) -> None:
+        if not self.held:
+            await self._semaphore.acquire()
+            self.held = True
+
+    def release(self) -> None:
+        if self.held:
+            self.held = False
+            self._semaphore.release()
 
 
 class _Stopped(Exception):
@@ -182,6 +216,12 @@ class Job:
     background: bool = False
     # JOB_STATUS_NAMES=legacy: `status` in answers uses the names before 0.5.0.
     legacy_names: bool = field(default=False, repr=False)
+    # Engine fallback: every engine the job was tried on, in order (agent_worker.fallback.Attempt rows).
+    attempts: list[dict[str, Any]] = field(default_factory=list)
+    # Tool calls so far (with what they did and returned), in memory only: for a handoff to the next engine.
+    journal: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    # While queued for an engine (waiting_for == "engine"): why, and when it goes on.
+    wait_note: str = ""
 
     @property
     def done(self) -> bool:
@@ -196,6 +236,8 @@ class Job:
 
     def status_message(self, blocked_by: str | None = None) -> str:
         """What the status means right now, for people and for the MCP Task statusMessage."""
+        if self.status == st.QUEUED and self.waiting_for == "engine":
+            return "queued: " + (self.wait_note or "waiting for an engine")
         if self.status == st.QUEUED:
             what = {"workspace": "another job in this workspace", "session": "another job in this session",
                     "slot": "a free slot (MAX_CONCURRENT_JOBS)"}.get(self.waiting_for, "its start")
@@ -226,6 +268,15 @@ class Job:
                     break
         last = self.events[-1].get("at", "") if self.events else ""
         return _short(step, 200), last
+
+    def engines_used(self) -> list[str]:
+        """Engines that ran this job (skipped ones not), in order."""
+        out: list[str] = []
+        for row in self.attempts:
+            name = row.get("engine")
+            if row.get("status") != "skipped" and name and (not out or out[-1] != name):
+                out.append(name)
+        return out
 
     def runtime_seconds(self) -> int | None:
         started = _parse(self.started_at)
@@ -274,6 +325,9 @@ class Job:
             "duration_ms": self.duration_ms,
             "events": len(self.events),
             "approved_hosts": sorted(self.approved_hosts),
+            # Engine fallback (FALLBACK_ENGINES): which engines ran, and every try with why it ended.
+            "engines_used": self.engines_used() or None,
+            "fallback": self.attempts or None,
         }
 
 
@@ -365,6 +419,14 @@ class JobManager:
         self._holders: dict[tuple, str] = {}
         self._legacy_names = settings.job_status_names == "legacy"
         self.closing = False
+        # Engine fallback chain: which engines are blocked until when (see agent_worker.fallback).
+        self.health = fb.EngineHealth(
+            settings.fallback_backoff,
+            lock_seconds=settings.fallback_lock_seconds,
+            promote=settings.fallback_promote,
+            path=settings.data_dir / "fallback-state.json",
+        )
+        self.wait_poll = fb.WAIT_POLL_SECONDS
         self._restore()
 
     def _restore(self) -> None:
@@ -395,6 +457,7 @@ class JobManager:
                 changes=data.get("changes"),
                 duration_ms=data.get("duration_ms"),
                 events=events,
+                attempts=list(data.get("fallback") or []),
             )
             if not job.done:
                 job.set_status(st.FAILED)
@@ -420,10 +483,17 @@ class JobManager:
         except WorkspaceError as exc:
             raise JobError(str(exc)) from exc
         pick = getattr(self.engine, "pick", None)
+        model = (req.model or "").strip()
         try:
-            engine = pick(req.engine) if callable(pick) else "cursor"
+            if self.fallback_on and not (req.engine or "").strip() and not model:
+                # Nothing asked for: the chain's first engine, with its model.
+                engine, model = self.settings.fallback_engines[0]
+            else:
+                engine = pick(req.engine) if callable(pick) else "cursor"
         except EngineError as exc:
             raise JobError(str(exc)) from exc
+        if self.fallback_on and not model:
+            model = dict(self.settings.fallback_engines).get(engine, "")
         if req.mcp_servers and not self.settings.allow_request_mcp:
             raise JobError("This worker does not accept MCP servers with a job (ALLOW_REQUEST_MCP=false).")
         try:
@@ -437,7 +507,7 @@ class JobManager:
             workspace=name,
             path=path,
             session=(req.session or "").strip()[:200],
-            model=(req.model or "").strip(),
+            model=model,
             effort=(req.effort or "").strip(),
             profile=narrow_profile(req.tools, self.settings.tool_profile),
             mcp_servers=with_depth(servers, req.depth + 1),
@@ -505,6 +575,10 @@ class JobManager:
     # ---- run ---------------------------------------------------------------------------------
 
     async def _emit(self, job: Job, event: dict[str, Any]) -> None:
+        if event.get("type") == "tool":
+            job.journal.append({**event, "engine": job.engine})
+            if any(key in event for key in _JOURNAL_ONLY):
+                event = {k: v for k, v in event.items() if k not in _JOURNAL_ONLY}
         full = len(job.events) >= _MAX_EVENTS
         if full and event.get("type") not in _PAST_CAP:
             return
@@ -563,13 +637,9 @@ class JobManager:
                 await lock.acquire()
                 job.held.append(key)
                 self._holders[key] = job.id
-            if self._slots.locked():
-                job.waiting_for, job.waiting_key = "slot", ()
-                await self._emit(
-                    job,
-                    {"type": "status", "text": f"Waiting for a free slot (MAX_CONCURRENT_JOBS={self.settings.max_concurrent_jobs})..."},
-                )
-            async with self._slots:
+            slot = _Slot(self._slots)
+            await self._take_slot(job, slot)
+            try:
                 job.waiting_for, job.waiting_key = "", ()
                 job.set_status(st.WORKING)
                 job.started_at = _now()
@@ -577,14 +647,19 @@ class JobManager:
                 self.store.save(job)
                 await self._emit(job, {"type": "status", "text": "Running"})
                 try:
-                    outcome = await self._supervise(job, spec)
+                    if self.fallback_on:
+                        outcome = await self._run_chain(job, spec, slot)
+                    else:
+                        outcome = await self._supervise(job, spec)
                 except _Stopped:
                     status, message = job.stop_status or st.CANCELLED, job.stop_reason or "Cancelled."
                     await self._emit(job, {"type": "error" if status == st.FAILED else "status", "message": message,
                                            "text": message})
                     self._finish(job, status, error=message)
-                    await self._cleanup(job, spec)
+                    await self._cleanup(job, job.spec or spec)
                     return
+            finally:
+                slot.release()
             fields = dict(
                 result=outcome.text,
                 error=outcome.error,
@@ -598,6 +673,9 @@ class JobManager:
                 fields["model"] = outcome.model
             # Engines report succeeded/failed/cancelled; the job uses the MCP Task names.
             status = st.normalize(outcome.status) or st.FAILED
+            used = job.engines_used()
+            if len(used) > 1:
+                await self._emit(job, {"type": "status", "text": "Engines: " + " → ".join(used)})
             if status == st.COMPLETED:
                 await self._emit(job, {"type": "result", "text": outcome.text})
             else:
@@ -617,6 +695,259 @@ class JobManager:
         finally:
             job.waiting_for, job.waiting_key = "", ()
             self._release(job)
+
+    # ---- engine fallback ---------------------------------------------------------------------
+
+    @property
+    def fallback_on(self) -> bool:
+        """FALLBACK_ENGINES names a chain and the worker has several engines (an EngineRouter)."""
+        return bool(self.settings.fallback_engines) and isinstance(getattr(self.engine, "engines", None), dict)
+
+    def engine_signed_in(self, name: str) -> None:
+        """A new credential for an engine: an auth block from the old one no longer holds. Waiting jobs
+        notice on their next look (at most wait_poll seconds)."""
+        state = self.health.state(name)
+        if state is not None and state.kind == fb.AUTH:
+            self.health.mark_ok(name)
+
+    async def _take_slot(self, job: Job, slot: _Slot) -> None:
+        if self._slots.locked():
+            job.waiting_for, job.waiting_key = "slot", ()
+            await self._emit(
+                job,
+                {"type": "status", "text": f"Waiting for a free slot (MAX_CONCURRENT_JOBS={self.settings.max_concurrent_jobs})..."},
+            )
+        await slot.acquire()
+
+    def _chain(self, spec: RunSpec) -> list[tuple[str, str]]:
+        """The engines to try, in order: the job's own engine first, then the chain below it (all of it when
+        the job's engine is not part of the chain)."""
+        chain = list(self.settings.fallback_engines)
+        names = [name for name, _ in chain]
+        if spec.engine in names:
+            at = names.index(spec.engine)
+            rest = chain[at + 1 :]
+        else:
+            rest = chain
+        return [(spec.engine, spec.model)] + [(name, model) for name, model in rest if name != spec.engine]
+
+    def _ready(self, name: str) -> bool:
+        """The cheap probe: is the engine set up and signed in (auth_status "ready")? No model prompt."""
+        engine = (getattr(self.engine, "engines", None) or {}).get(name)
+        try:
+            return bool(engine is not None and engine.available)
+        except Exception:
+            return False
+
+    def _previous_job(self, job: Job) -> Job | None:
+        """The last job of the same session before this one."""
+        if not job.session:
+            return None
+        rows = [other for other in self.jobs.values()
+                if other is not job and other.workspace == job.workspace and other.session == job.session
+                and other.created_at <= job.created_at and other.done and other.started_at]
+        return max(rows, key=lambda other: other.created_at, default=None)
+
+    def _history(self, job: Job) -> str:
+        """Earlier turns of the session, for an engine that has never seen it."""
+        if not job.session:
+            return ""
+        rows = sorted((other for other in self.jobs.values()
+                       if other is not job and other.workspace == job.workspace and other.session == job.session
+                       and other.created_at <= job.created_at and other.status == st.COMPLETED),
+                      key=lambda other: other.created_at)[-_HISTORY_TURNS:]
+        turns = []
+        for other in rows:
+            turns.append(f"User: {_clip(other.task, _HISTORY_CHARS)}\nAssistant: {_clip(other.result, _HISTORY_CHARS)}")
+        return "\n\n".join(turns)
+
+    def _start_index(self, job: Job, chain: list[tuple[str, str]]) -> tuple[int, str]:
+        """Where in the chain this turn starts, and the engine that served the session last ('' if none).
+        Promotion only happens here (a job's start), never in the middle of a run."""
+        previous = self._previous_job(job)
+        last = (previous.engine if previous is not None else "") or ""
+        names = [name for name, _ in chain]
+        if not last or last not in names or names.index(last) == 0:
+            return 0, last
+        at = names.index(last)
+        fell_back = previous is not None and len(previous.engines_used()) > 1 or (
+            previous is not None and previous.attempts and previous.attempts[0].get("engine") != last)
+        if self.settings.fallback_promote == "off":
+            # The session stays on the engine that took over.
+            return at, last
+        finished = fb_stamp(previous.finished_at) if previous is not None else None
+        if fell_back and finished is not None and self.health.clock() - finished < self.settings.fallback_lock_seconds:
+            # It only just switched: no flapping back and forth.
+            return at, last
+        return 0, last
+
+    def _next_engine(self, job: Job, chain: list[tuple[str, str]], start: int, noted: set[str]):
+        """(index, engine, model) of the first usable engine from `start`; skipped ones are noted once."""
+        for index in range(start, len(chain)):
+            name, model = chain[index]
+            if not self._ready(name):
+                if name not in noted:
+                    noted.add(name)
+                    job.attempts.append(fb.Attempt(name, model, "skipped", "nicht angemeldet").as_dict())
+                continue
+            if self.health.blocked_until(name):
+                if name not in noted:
+                    noted.add(name)
+                    job.attempts.append(fb.Attempt(name, model, "skipped", self.health.note(name)).as_dict())
+                continue
+            return index, name, model
+        return None
+
+    def _wait_note(self, chain: list[tuple[str, str]]) -> tuple[str, float | None]:
+        notes, wake = [], None
+        for name, _ in chain:
+            if not self._ready(name):
+                notes.append(f"{name} nicht angemeldet")
+                continue
+            until = self.health.blocked_until(name)
+            if until:
+                notes.append(self.health.note(name))
+                wake = until if wake is None else min(wake, until)
+        when = (f"geht um {fb.clock(wake)} automatisch weiter" if wake
+                else "geht automatisch weiter, sobald eine Engine angemeldet ist")
+        return f"Keine Engine frei ({'; '.join(notes)}) – Job wartet und {when}", wake
+
+    async def _wait_for_engine(self, job: Job, chain: list[tuple[str, str]], slot: _Slot) -> None:
+        """No engine of the chain can run: wait (without a slot) until one can, instead of failing."""
+        loop = asyncio.get_running_loop()
+        note, wake = self._wait_note(chain)
+        job.wait_note, job.waiting_for, job.waiting_key = note, "engine", ()
+        job.set_status(st.QUEUED)
+        self.store.save(job)
+        await self._emit(job, {"type": "status", "text": note})
+        logger.info("job %s waits for an engine: %s", job.id, note)
+        slot.release()
+        paused = loop.time()
+        try:
+            while True:
+                delay = self.wait_poll
+                if wake is not None:
+                    delay = min(delay, max(0.01, wake - self.health.clock()))
+                try:
+                    await asyncio.wait_for(job.stop.wait(), delay)
+                except asyncio.TimeoutError:
+                    pass
+                if job.stop.is_set():
+                    raise _Stopped()
+                if any(self._ready(name) and not self.health.blocked_until(name) for name, _ in chain):
+                    break
+                fresh, wake = self._wait_note(chain)
+                if fresh != job.wait_note:
+                    job.wait_note = fresh
+                    job.changed.set()
+            await self._take_slot(job, slot)
+        finally:
+            job.wait_note = ""
+        if job.stop.is_set():
+            slot.release()
+            raise _Stopped()
+        # Waiting is no runtime: the watchdogs count from here.
+        now = loop.time()
+        job.started_clock += now - paused
+        job.activity_clock = now
+        job.waiting_for, job.waiting_key = "", ()
+        job.set_status(st.WORKING)
+        self.store.save(job)
+        await self._emit(job, {"type": "status", "text": "Engine wieder verfügbar – Job geht weiter"})
+
+    def _forget(self, name: str, spec: RunSpec) -> None:
+        """The engine's own session for this conversation is stale (it missed turns on another engine)."""
+        engine = (getattr(self.engine, "engines", None) or {}).get(name)
+        forget = getattr(engine, "forget", None)
+        if spec.session and callable(forget):
+            try:
+                forget(spec.workspace, spec.session)
+            except Exception:
+                logger.debug("forget %s session failed", name, exc_info=True)
+
+    async def _run_chain(self, job: Job, spec: RunSpec, slot: _Slot) -> Outcome:
+        """Run the job down the fallback chain: on a provider-side failure the next engine takes over (same
+        job, with a handoff). No engine left: wait for one. Raises _Stopped and EngineError like _supervise."""
+        chain = self._chain(spec)
+        start, last = self._start_index(job, chain)
+        noted: set[str] = set()
+        handoff: fb.Handoff | None = None
+        start_head = await git_head(spec.path)
+        first = True
+        while True:
+            pick = self._next_engine(job, chain, start, noted)
+            if pick is None:
+                await self._wait_for_engine(job, chain, slot)
+                # After a wait the whole chain is tried again, from the top.
+                start, noted = 0, set()
+                continue
+            index, name, model = pick
+            run = replace(spec, engine=name, model=model)
+            if handoff is not None:
+                run.task, run.context = fb.handoff_message(handoff, name), ""
+                self._forget(name, spec)
+            elif spec.session and last and last != name:
+                # The session moves to another engine (back up, or down at the start): give it the conversation.
+                self._forget(name, spec)
+                if not run.context.strip():
+                    run.context = self._history(job)
+            if first and last and name != last:
+                names = [n for n, _ in chain]
+                if last in names and names.index(name) < names.index(last):
+                    await self._emit(job, {"type": "status", "text": f"{name} wieder verfügbar – zurück von {last} zu {name}"})
+            first = False
+            job.engine, job.model = name, model or self.default_model(name)
+            job.spec = run
+            attempt = fb.Attempt(name, job.model, "running", started_at=_now())
+            job.attempts.append(attempt.as_dict())
+            self.store.save(job)
+            mark = len(job.events)
+            failure: fb.Failure | None = None
+            try:
+                outcome = await self._supervise(job, run)
+            except EngineError as exc:
+                failure = fb.classify(exc)
+                if failure is None:
+                    job.attempts[-1] = {**attempt.as_dict(), "status": "failed", "reason": _short(str(exc), 200),
+                                        "finished_at": _now()}
+                    raise
+                outcome = None
+            else:
+                if st.normalize(outcome.status) == st.COMPLETED:
+                    self.health.mark_ok(name)
+                else:
+                    failure = fb.classify(outcome)
+                if failure is None:
+                    ended = "completed" if st.normalize(outcome.status) == st.COMPLETED else "failed"
+                    job.attempts[-1] = {**attempt.as_dict(), "status": ended, "finished_at": _now(),
+                                        **({"reason": _short(outcome.error, 200)} if outcome.error else {})}
+                    return outcome
+            # Provider-side failure: block the engine, hand the job to the next one.
+            self.health.mark_failed(name, failure)
+            reason = fb.describe(name, failure)
+            job.attempts[-1] = {**attempt.as_dict(), "status": "handed_off", "reason": reason,
+                                "kind": failure.kind, "finished_at": _now()}
+            logger.info("job %s: %s (%s)", job.id, reason, failure.message)
+            try:
+                await proctree.kill_tagged(JOB_ENV, job.id)
+            except Exception:
+                logger.debug("job %s: leftovers of %s not killed", job.id, name, exc_info=True)
+            partial = "".join(str(e.get("delta") or "") for e in job.events[mark:] if e.get("type") == "text")
+            if handoff is None:
+                handoff = fb.Handoff(task=spec.task, history=spec.context.strip() or self._history(job))
+            handoff.reasons.append(reason)
+            handoff.partial.append((name, partial))
+            handoff.journal = list(job.journal)
+            handoff.changes = await git_changes(spec.path, start_head)
+            if partial.strip():
+                await self._emit(job, {"type": "text", "delta": "\n\n"})
+            following = self._next_engine(job, chain, index + 1, noted)
+            if following is not None:
+                text = f"{reason} – {following[1]} übernimmt"
+            else:
+                text = f"{reason} – keine weitere Engine frei"
+            await self._emit(job, {"type": "status", "text": text})
+            start = index + 1
 
     def _overdue(self, job: Job, now: float) -> tuple[str, str] | None:
         """(status, reason) when a watchdog limit is past, else None."""

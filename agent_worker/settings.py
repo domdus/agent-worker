@@ -123,6 +123,14 @@ class Settings:
     # /v1 streams: where agent steps (tool calls, status) go. "reasoning_content" (Open WebUI, Hermes show
     # it as thinking), "reasoning" (OpenRouter-style field) or "none" (only the answer). X-Agent-Steps overrides.
     openai_steps: str = "reasoning_content"
+    # Engine fallback chain (agent_worker.fallback): ordered (engine, model) pairs; empty = off.
+    fallback_engines: tuple[tuple[str, str], ...] = ()
+    # When a session goes back up to its preferred engine: turn, reset or off.
+    fallback_promote: str = "turn"
+    # Backoff steps (seconds) for an engine that failed without a known reset time.
+    fallback_backoff: tuple[int, ...] = (300, 900, 3600)
+    # Shortest block after a failure, and how long a session stays put after it switched engines.
+    fallback_lock_seconds: int = 120
 
     @property
     def claude_token_path(self) -> Path:
@@ -163,6 +171,8 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> Settings:
+        from agent_worker.fallback import parse_backoff, parse_chain, promote_mode
+
         data_dir = Path(os.environ.get("DATA_DIR", "./data")).resolve()
         workspaces_dir = Path(os.environ.get("WORKSPACES_DIR", str(data_dir / "workspaces"))).resolve()
         # WORKSPACE_DIR binds the default workspace to one host folder, like the HA runtime did.
@@ -214,6 +224,10 @@ class Settings:
                 line.strip() for line in os.environ.get("CODEX_CONFIG", "").splitlines() if "=" in line and line.strip()
             ),
             openai_steps=steps_mode(os.environ.get("OPENAI_STEPS", "")) or "reasoning_content",
+            fallback_engines=parse_chain(os.environ.get("FALLBACK_ENGINES", ""), ENGINES),
+            fallback_promote=promote_mode(os.environ.get("FALLBACK_PROMOTE", "")),
+            fallback_backoff=parse_backoff(os.environ.get("FALLBACK_BACKOFF", "")),
+            fallback_lock_seconds=_int("FALLBACK_LOCK_SECONDS", 120, 0),
         )
 
 

@@ -51,7 +51,7 @@ from agent_worker.engine import (
     git_changes,
     git_head,
 )
-from agent_worker.events import _tool_event
+from agent_worker.events import _tool_event, tool_output
 from agent_worker.redact import redact
 from agent_worker.settings import Settings
 
@@ -290,9 +290,11 @@ def map_notification(method: str, payload: Any, state: TurnState) -> list[dict[s
         if kind == "reasoning":
             events.append({"type": "status", "text": "Thinking..."})
         elif kind == "commandExecution":
-            events.append(_tool_event("shell", "start", _short(f"Running {item.get('command') or ''}"), str(item.get("id") or "")))
+            events.append(_tool_event("shell", "start", _short(f"Running {item.get('command') or ''}"), str(item.get("id") or ""),
+                                      detail=str(item.get("command") or "")[:400]))
         elif kind == "fileChange":
-            events.append(_tool_event("edit", "start", _short(f"Editing {_paths(item)}"), str(item.get("id") or "")))
+            events.append(_tool_event("edit", "start", _short(f"Editing {_paths(item)}"), str(item.get("id") or ""),
+                                      detail=_paths(item)[:400]))
         elif kind == "webSearch":
             events.append(_tool_event("web_search", "start", _short(f"Searching the web: {item.get('query') or ''}"), str(item.get("id") or "")))
         elif _tool_name(item):
@@ -314,8 +316,13 @@ def map_notification(method: str, payload: Any, state: TurnState) -> list[dict[s
                 events.append({"type": "text", "delta": text})
         elif _tool_name(item):
             name = _tool_name(item)
-            text = "Tool failed" if _failed(item) else "Finished"
-            events.append(_tool_event(name, "end", text, str(item.get("id") or "")))
+            failed = _failed(item)
+            text = "Tool failed" if failed else "Finished"
+            output = item.get("aggregatedOutput") or item.get("result") or item.get("error") or ""
+            if item.get("exitCode") not in (None, 0):
+                output = f"exit {item.get('exitCode')}: {output}"
+            events.append(_tool_event(name, "end", text, str(item.get("id") or ""), output=tool_output(output),
+                                      failed=failed))
     elif method == "thread/tokenUsage/updated":
         usage = data.get("tokenUsage") or {}
         if isinstance(usage, dict):
@@ -551,6 +558,7 @@ class CodexEngine:
                 text = error_text(error, used_model, self._secrets())
             return Outcome(
                 status="failed",
+                error_kind=_error_kind(error),
                 error=text,
                 text=state.final_text(),
                 run_id=thread_id,

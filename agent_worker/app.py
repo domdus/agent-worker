@@ -264,6 +264,14 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
                 "sandbox": settings.codex_sandbox,
             },
             "default_engine": default,
+            # Engine fallback chain (FALLBACK_ENGINES); null when off. blocked: engines out until when.
+            "fallback": {
+                "engines": [f"{name}:{model}" if model else name for name, model in settings.fallback_engines],
+                "promote": settings.fallback_promote,
+                "backoff_seconds": list(settings.fallback_backoff),
+                "blocked": {name: {"until": row["blocked_until"], "kind": row["kind"], "reset_known": row["reset_known"]}
+                            for name, row in manager.health.overview().items() if row["blocked"]},
+            } if settings.fallback_engines else None,
             "model": settings.model,
             "tool_profile": settings.tool_profile,
             "token_required": bool(settings.token) or not settings.open_without_token(),
@@ -340,6 +348,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
                 detail = {"error": "bad_code", "attempts_left": max(0, left)}
             raise HTTPException(status_code=status, detail=detail) from None
         save_token(settings.claude_token_path, token)
+        manager.engine_signed_in("claude")
         logger.info("Claude sign-in finished; Plan token saved")
         source = credential_source(settings)
         return {
@@ -395,6 +404,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
         body = login.as_dict()
         if login.status == "succeeded":
             logger.info("Codex sign-in finished; auth.json saved")
+            manager.engine_signed_in("codex")
             body["credential"] = credential_source(settings)
         return body
 
@@ -443,6 +453,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             verified = True
         cursor_auth.save_key(cursor_auth.key_path(settings), key)
         _cursor_changed()
+        manager.engine_signed_in("cursor")
         logger.info("Cursor API key stored%s", " (verified)" if verified else "")
         source = cursor_auth.credential_source(settings)
         return {

@@ -21,6 +21,11 @@ services:
     build: .
     container_name: agent-worker
     env_file: .env
+    # Engine fallback chain (optional, see README "Engine fallback chain"). Values here win over .env.
+    # environment:
+    #   FALLBACK_ENGINES: claude,cursor,codex
+    #   FALLBACK_PROMOTE: turn          # turn | reset | off
+    #   FALLBACK_BACKOFF: 5m,15m,60m
     ports:
       # Only this machine. Use "8787:8787" to open it to your LAN (WORKER_TOKEN is then required).
       - "127.0.0.1:8787:8787"
