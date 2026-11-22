@@ -35,7 +35,7 @@ CURSOR_MODEL=composer-2.5
 ```yaml
 services:
   agent-worker:
-    image: ghcr.io/domdus/agent-worker:latest   # or pin a version, e.g. :0.6.0
+    image: ghcr.io/domdus/agent-worker:latest   # or pin a version, e.g. :0.7.0
     container_name: agent-worker
     env_file: .env
     ports:
@@ -351,7 +351,8 @@ The MCP endpoint has one read-only tool, `auth_status`, with the same overview a
 `agent_run(task, workspace?, session?, model?, tools?, mcp_servers?, wait_seconds?, engine?, background?, conversation_id?)`
 
 - Waits up to `wait_seconds` (default `MCP_WAIT_SECONDS`, 20) for the agent to finish, then returns `result`, `changes` (`files` from `git status`, new `commits`), `usage` and `model`.
-- If the task takes longer, it returns `status: "working"` (or `"queued"`) and a `job_id`. The caller then uses `agent_job(job_id, wait_seconds)` to wait for it, or `agent_cancel(job_id)` to stop it.
+- **With `_meta.progressToken`** (MCP progress) the call does not return early: it stays open until the job is `completed`, `failed` or `cancelled` and sends `notifications/progress` meanwhile; see [MCP progress](#mcp-progress-_metaprogresstoken). `wait_seconds` and `MCP_MAX_WAIT_SECONDS` do not apply then.
+- If the task takes longer (and the call has no `progressToken`), it returns `status: "working"` (or `"queued"`) and a `job_id`. The caller then uses `agent_job(job_id, wait_seconds)` to wait for it, or `agent_cancel(job_id)` to stop it.
 - **No wait is longer than `MCP_MAX_WAIT_SECONDS` (25)**, whatever `wait_seconds` asks for. This applies to `agent_run`, `agent_job`, `agent_approve` and `agent_cancel`. Many MCP clients give up on a tool call after 30 s; if the call timed out, the client would never get the `job_id`. Raise the cap only if your client waits longer. The `job_id` is fixed before the wait starts: it is in the worker log (`agent_run job_id=...`), in every MCP progress message (`job <id>: ...`) and in `agent_jobs`.
 - `model` in the answer is the model the job runs on: the one you asked for, else the engine's default (`CURSOR_MODEL`, `CLAUDE_MODEL`, `CODEX_MODEL`). It is `null` for Codex without `CODEX_MODEL` until the job has run; then it shows the model Codex picked.
 - `status: "input_required"` (before 0.5.0: `needs_approval`): a command on an approval host is waiting for the user; `status_message` says which (see [Approval for selected hosts](#approval-for-selected-hosts)).
@@ -457,9 +458,24 @@ Job handling follows MCP where MCP has a standard for it. The tools `agent_run`,
 
 The `/v1` chat API is not affected; it never exposed job statuses except in `agent_worker.status` metadata (which follows `JOB_STATUS_NAMES`).
 
+### MCP progress (`_meta.progressToken`)
+
+The MCP way to run a long tool call: the client sends a `progressToken` and simply waits for the result, resetting its timeout on every progress notification (most SDKs: `resetTimeoutOnProgress` or similar).
+
+- `agent_run` with `params._meta.progressToken` keeps the call open **until the job ends** (`completed`, `failed`, `cancelled`) and then returns the same payload as `agent_job` (`result`, `changes`, `usage`, `task`, …). `wait_seconds`, `MCP_WAIT_SECONDS` and `MCP_MAX_WAIT_SECONDS` do not apply; the job's watchdogs (`JOB_MAX_RUNTIME_SECONDS`, `JOB_IDLE_TIMEOUT_SECONDS`, `APPROVAL_TIMEOUT_SECONDS`) still end it.
+- `notifications/progress` goes out on the first step, whenever the status or the last step changes (for example `job <id>: Calling Bash…`, `job <id>: queued: waiting for another job in this workspace`) and at least every `MCP_PROGRESS_INTERVAL_SECONDS` (10) as keepalive. `message` always starts with `job <id>:`, so a client that gives up still knows the `job_id`. `progress` grows with every notification (roughly the job's event count); `total` is only set on the last one (`progress == total`, message `completed`/`failed`/`cancelled`), because an agent has no known number of steps.
+- **Approvals** (`input_required`): if the client declared the `elicitation` capability, the worker asks once per approval with `elicitation/create` (the command, the host, an `approve` boolean and an optional note) and goes on with the answer; while the question is open it keeps sending progress. If the approval is answered another way meanwhile (`POST /jobs/<id>/approve`, `agent_approve`), the question is withdrawn. Without elicitation, or when the user dismisses it, a progress message says what the job waits for (`input_required: waiting for a human to approve ssh on root@prod: reboot …`) and the call keeps waiting; the other approval paths work as before. On 2026-07-28 HTTP (no server-to-client requests) the worker returns an `InputRequiredResult` and the client retries the call with the answer, which again waits with progress.
+- Without a `progressToken` nothing changes: `agent_run` answers after `wait_seconds`/`MCP_WAIT_SECONDS` with the `job_id` and status, for clients that poll with `agent_job`.
+- `MCP_WAIT_WITH_PROGRESS=false` turns this off: every client gets the old behaviour (progress messages during the capped wait only).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MCP_WAIT_WITH_PROGRESS` | `true` | `agent_run` with a `progressToken` waits until the job ends. |
+| `MCP_PROGRESS_INTERVAL_SECONDS` | `10` | Longest gap between two progress notifications (keepalive). |
+
 ### MCP cancellation (`notifications/cancelled`)
 
-An `agent_run` call is bound to the job it starts **while the call is open** (up to `MCP_MAX_WAIT_SECONDS`):
+An `agent_run` call is bound to the job it starts **while the call is open** (up to `MCP_MAX_WAIT_SECONDS`, or with a `progressToken` until the job ends):
 
 - **The client cancels the call** (`notifications/cancelled` with the call's request id): the job is cancelled with "Cancelled by the MCP client (notifications/cancelled for the agent_run call)." The engine is stopped, its process tree killed and the workspace freed, exactly like `agent_cancel` (see [Watchdogs and cancel](#watchdogs-and-cancel)).
 - **The client disconnects while the call is open**, where the worker can see it: the job is cancelled with "Cancelled: the MCP client closed the agent_run call while it was open (…)". On protocol 2026-07-28 over HTTP, a closed request stream *is* the cancel signal (that version has no client-to-server notification on HTTP), so a cancel there reads as a disconnect. On the older stateful HTTP transport (2025-x), a dropped response stream is not reported to the tool, so the job keeps running; stop it with `agent_cancel`.
@@ -472,13 +488,13 @@ An `agent_run` call is bound to the job it starts **while the call is open** (up
 | `MCP_CANCEL_ON_CANCELLED` | `true` | `notifications/cancelled` for an open `agent_run` cancels its job. `false`: the job runs on. |
 | `MCP_CANCEL_ON_DISCONNECT` | `true` | A disconnect (and, on 2026-07-28 HTTP, a client cancel) during an open `agent_run` cancels its job. `false`: the job runs on. |
 
-Mind that some clients send `notifications/cancelled` on their own timeout. With the default `MCP_MAX_WAIT_SECONDS` (25) the worker answers before the usual 30 s timeouts; if your client gives up sooner, lower the cap or start jobs with `background: true`.
+Mind that some clients send `notifications/cancelled` on their own timeout. With the default `MCP_MAX_WAIT_SECONDS` (25) the worker answers before the usual 30 s timeouts; if your client gives up sooner, lower the cap or start jobs with `background: true`. With a `progressToken` the client must reset its timeout on progress (or have a long enough one), otherwise its timeout cancels the job.
 
 How it works: the MCP SDK (mcp 2.3.0) cancels the tool handler for `notifications/cancelled` (and on 2026-07-28 HTTP, for a closed stream); `agent_run` catches that and cancels the job. To tell a cancel from a disconnect the worker reads the request's `cancel_requested` flag, which the SDK sets but does not expose on the tool context yet; if that ever fails, the call counts as a disconnect.
 
 ### MCP Tasks (`tasks/*`, spec 2025-11-25, experimental)
 
-**Not served yet:** the MCP SDK this worker uses (mcp 2.3.0) has no server-side Tasks. It ships the 2025-11-25 Task wire types, but leaves `tasks/get`, `tasks/list`, `tasks/cancel`, `tasks/result` and `notifications/tasks/status` out of its method tables on purpose, and the 2026 revision moves Tasks into an extension (SEP-2663, `io.modelcontextprotocol/tasks`). Rather than hand-roll the protocol, the worker maps its jobs 1:1 onto Tasks, so serving them is a switch once the SDK has it:
+**Not served yet** (checked again for 0.7.0, mcp 2.3.0 is still the newest release): the MCP SDK this worker uses has no server-side Tasks. It ships the 2025-11-25 Task wire types, but leaves `tasks/get`, `tasks/list`, `tasks/cancel`, `tasks/result` and `notifications/tasks/status` out of its method tables on purpose, and the 2026 revision moves Tasks into an extension (SEP-2663, `io.modelcontextprotocol/tasks`). Rather than hand-roll the protocol, the worker maps its jobs 1:1 onto Tasks, so serving them is a switch once the SDK has it:
 
 | MCP Tasks | Worker today |
 | --- | --- |
@@ -522,9 +538,11 @@ Jobs in different workspaces run in parallel (up to `MAX_CONCURRENT_JOBS`); in o
 
 ### What a client (e.g. Home Assistant AI Workspace) should send
 
-- `agent_run` with `_meta: {"io.github.domdus/conversation_id": "<conversation id>"}` on every call (an opaque id such as the chat's UUID, not a token).
+- `agent_run` with `_meta: {"progressToken": <unique token>, "io.github.domdus/conversation_id": "<conversation id>"}` on every call. The conversation id is an opaque id such as the chat's UUID, not a token.
+- With the `progressToken`, wait for the call's result and reset the call's timeout on every `notifications/progress` (keepalive at least every `MCP_PROGRESS_INTERVAL_SECONDS`, 10 s). Show the progress `message` (last step) if you like.
+- Declare the `elicitation` capability in `initialize` and show `elicitation/create` requests to the **user** (not the model): that is how the worker asks for approvals of commands on approval hosts. Without it, approvals go through `POST /jobs/<id>/approve` or `agent_approve`.
 - When the user presses stop: send `notifications/cancelled` for the open `agent_run` call (most MCP SDKs do this when the call is cancelled), **and** `agent_cancel(conversation_id="<conversation id>")`, which also catches jobs whose `agent_run` call has already returned a `job_id`.
-- If the answer has a `job_id` and `status` `queued`/`working`, poll `agent_job(job_id, wait_seconds=20)` about every `task.pollInterval` ms until the status is `completed`, `failed` or `cancelled`. Treat `input_required` as "ask the user" (or answer the elicitation the worker sends).
+- Without a `progressToken` (older clients): if the answer has a `job_id` and `status` `queued`/`working`, poll `agent_job(job_id, wait_seconds=20)` about every `task.pollInterval` ms until the status is `completed`, `failed` or `cancelled`. Treat `input_required` as "ask the user" (or answer the elicitation the worker sends).
 - Compare `status` against the MCP names; read `legacy_status` only if you still need the old ones.
 - For work that must outlive the chat (a long refactor the user walks away from), set `background: true`.
 
@@ -630,7 +648,7 @@ The guard sees what the agent runs with the normal commands. It is a guardrail f
 
 ## Configuration
 
-See [.env.example](.env.example). The most important settings: `CURSOR_API_KEY`, `WORKER_TOKEN`, `CURSOR_MODEL`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `OPENAI_API_KEY`, `CODEX_MODEL`, `CODEX_AUTH_JSON`, `CODEX_SANDBOX`, `CODEX_CONFIG`, `DEFAULT_ENGINE`, `FALLBACK_ENGINES`, `FALLBACK_PROMOTE` (turn), `FALLBACK_BACKOFF` (5m,15m,60m), `FALLBACK_LOCK_SECONDS` (120), `TOOL_PROFILE`, `MAX_CONCURRENT_JOBS` (2), `JOB_MAX_RUNTIME_SECONDS` (3600), `JOB_IDLE_TIMEOUT_SECONDS` (900), `APPROVAL_TIMEOUT_SECONDS` (1800), `MCP_WAIT_SECONDS` (20), `MCP_MAX_WAIT_SECONDS` (25), `MCP_CANCEL_ON_CANCELLED` (true), `MCP_CANCEL_ON_DISCONNECT` (true), `JOB_STATUS_NAMES` (mcp), `TASK_POLL_INTERVAL_MS` (5000), `WORKSPACE_DIR`, `GIT_REPO`, `SSH_KEY`, `SSH_KEYS_DIR`, `SSH_CONFIG`, `SSH_KNOWN_HOSTS`, `SSH_APPROVAL_HOSTS`, `APPROVAL_TOOL`, `WORKER_INSTRUCTIONS`, `REWRITE_LOOPBACK_HOST`.
+See [.env.example](.env.example). The most important settings: `CURSOR_API_KEY`, `WORKER_TOKEN`, `CURSOR_MODEL`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `OPENAI_API_KEY`, `CODEX_MODEL`, `CODEX_AUTH_JSON`, `CODEX_SANDBOX`, `CODEX_CONFIG`, `DEFAULT_ENGINE`, `FALLBACK_ENGINES`, `FALLBACK_PROMOTE` (turn), `FALLBACK_BACKOFF` (5m,15m,60m), `FALLBACK_LOCK_SECONDS` (120), `TOOL_PROFILE`, `MAX_CONCURRENT_JOBS` (2), `JOB_MAX_RUNTIME_SECONDS` (3600), `JOB_IDLE_TIMEOUT_SECONDS` (900), `APPROVAL_TIMEOUT_SECONDS` (1800), `MCP_WAIT_SECONDS` (20), `MCP_MAX_WAIT_SECONDS` (25), `MCP_WAIT_WITH_PROGRESS` (true), `MCP_PROGRESS_INTERVAL_SECONDS` (10), `MCP_CANCEL_ON_CANCELLED` (true), `MCP_CANCEL_ON_DISCONNECT` (true), `JOB_STATUS_NAMES` (mcp), `TASK_POLL_INTERVAL_MS` (5000), `WORKSPACE_DIR`, `GIT_REPO`, `SSH_KEY`, `SSH_KEYS_DIR`, `SSH_CONFIG`, `SSH_KNOWN_HOSTS`, `SSH_APPROVAL_HOSTS`, `APPROVAL_TOOL`, `WORKER_INSTRUCTIONS`, `REWRITE_LOOPBACK_HOST`.
 
 ## Development
 

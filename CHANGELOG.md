@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.7.0 (2026-11-22)
+
+MCP progress for long `agent_run` calls: a client that sends a `progressToken` simply waits for the result.
+
+### Added
+
+- `agent_run` with `_meta.progressToken` keeps the call open until the job is `completed`, `failed` or `cancelled` (no `MCP_WAIT_SECONDS`/`MCP_MAX_WAIT_SECONDS` cap) and returns the same payload as `agent_job`. Job watchdogs (`JOB_MAX_RUNTIME_SECONDS`, `JOB_IDLE_TIMEOUT_SECONDS`, `APPROVAL_TIMEOUT_SECONDS`) still apply.
+- `notifications/progress` on every change of status or last step (`job <id>: Calling Bash…`) and at least every `MCP_PROGRESS_INTERVAL_SECONDS` (10) as keepalive; `progress` always grows, the last notification has `total == progress` and the final status.
+- Approvals during such a call: asked once by elicitation (`elicitation/create`) when the client declared the capability, with keepalive progress while the question is open; withdrawn when the approval is answered another way. Without elicitation (or when dismissed) a progress message says what the job waits for, and `POST /jobs/<id>/approve` / `agent_approve` work as before.
+- `notifications/cancelled` for such a call cancels its job (unless `background=true`), as for the capped wait.
+- `MCP_WAIT_WITH_PROGRESS` (default `true`): `false` restores the old behaviour for every client.
+
+### Changed
+
+- Progress values during the capped wait now always increase (spec), and a pending elicitation is withdrawn when its approval is answered elsewhere.
+
+### Unchanged
+
+- Without a `progressToken`, `agent_run` answers after `wait_seconds`/`MCP_WAIT_SECONDS` with `job_id` and status, as before.
+- MCP Tasks (`tasks/*`) are still not served: mcp 2.3.0 (newest release) has the 2025-11-25 Task types but routes none of the methods; the job↔Task mapping stays.
+
+### Upgrade notes
+
+- Image: `ghcr.io/domdus/agent-worker:0.7.0` (or `:latest`): `docker compose pull && docker compose up -d --no-build` in the compose project dir with the existing `.env`. Recreating the container stops running jobs; do it when none are open.
+- Clients that send a `progressToken` (many SDKs do whenever a progress callback is set) now wait until the job ends: they should reset their call timeout on progress. If one cannot, set `MCP_WAIT_WITH_PROGRESS=false`.
+
 ## 0.6.0 (2026-11-20)
 
 Engine fallback chain. Also the first published release with the JSON mode of 0.5.1 (0.5.1 was not released on its own).
