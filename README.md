@@ -35,7 +35,7 @@ CURSOR_MODEL=composer-2.5
 ```yaml
 services:
   agent-worker:
-    image: ghcr.io/domdus/agent-worker:latest   # or pin a version, e.g. :0.7.1
+    image: ghcr.io/domdus/agent-worker:latest   # or pin a version, e.g. :0.7.2
     container_name: agent-worker
     env_file: .env
     ports:
@@ -372,6 +372,8 @@ The MCP endpoint has one read-only tool, `auth_status`, with the same overview a
 
 `agent_cancel(job_id)` stops one job; `agent_cancel(workspace="my-repo")` stops every queued and running job in that workspace; `agent_cancel(conversation_id="…")` every one of that conversation. A cancel stops the engine (the engine gets 10 s to stop on its own), then kills the processes the job started (shells, ssh, builds; see [Watchdogs](#watchdogs-and-cancel)). The workspace is free right after, and the next queued job starts.
 
+**Annotations and results (0.7.2).** Every tool has a `title` and MCP tool annotations (spec 2025-11-25): `agent_jobs`, `agent_job`, `agent_workspaces`, `auth_status` are `readOnlyHint`; `agent_run`, `agent_cancel` (and `agent_approve`) are `destructiveHint`; `agent_run` is `openWorldHint` (shell, ssh, web) and not idempotent, `agent_cancel` is idempotent. `agent_run`, `agent_job` and `agent_approve` publish a real `outputSchema` (`status` required; `job_id`, `status_message`, `task`, `approval`, `result`, `error`, `changes`, `usage`, `engines_used`, `fallback`, …; unknown fields allowed for later versions) and their `structuredContent` matches it. A job that `failed` or was `cancelled`, a refused request (`status: "rejected"`) and an unknown `job_id` (`status: "unknown"`) come back with `isError: true`, `structuredContent` kept. `agent_cancel` that cancelled something is not an error.
+
 `agent_workspaces()` also returns `default_models` (each engine's model for jobs that name none) and a short note on parallelism. `auth_status()` (read-only) shows which engines are signed in and their `default_model`. See [Sign in from a UI](#sign-in-from-a-ui).
 
 ## Parallel jobs
@@ -472,6 +474,14 @@ The MCP way to run a long tool call: the client sends a `progressToken` and simp
 | --- | --- | --- |
 | `MCP_WAIT_WITH_PROGRESS` | `true` | `agent_run` with a `progressToken` waits until the job ends. |
 | `MCP_PROGRESS_INTERVAL_SECONDS` | `10` | Longest gap between two progress notifications (keepalive). |
+
+### MCP protocol versions (2026-07-28 and the initialize era)
+
+The worker speaks both: the initialize handshake with `Mcp-Session-Id` (2024-11-05 … 2025-11-25) and 2026-07-28, where every POST carries its own envelope (`params._meta`) plus the routing headers `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name`. The MCP SDK picks the era by the `MCP-Protocol-Version` header alone, so a proxy that forwards only some headers used to turn a 2026-07-28 request into an HTTP 400 (`Missing session ID`, or `-32020` header mismatch). With `MCP_PROTOCOL_MODERN=auto` (default) the worker fills in a missing header from the request body and serves an `initialize` that arrives with a stale 2026-07-28 header on the handshake path; a header that is present and contradicts the body is still refused. `MCP_PROTOCOL_MODERN=off` answers every 2026-07-28 request with `-32022` (`UNSUPPORTED_PROTOCOL_VERSION`, `supported` = the handshake versions); clients that negotiate (`server/discover` first) fall back to `initialize`.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MCP_PROTOCOL_MODERN` | `auto` | `off`: no 2026-07-28, clients use the initialize handshake. |
 
 ### MCP cancellation (`notifications/cancelled`)
 
@@ -655,7 +665,7 @@ The guard sees what the agent runs with the normal commands. It is a guardrail f
 
 ## Configuration
 
-See [.env.example](.env.example). The most important settings: `CURSOR_API_KEY`, `WORKER_TOKEN`, `CURSOR_MODEL`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `OPENAI_API_KEY`, `CODEX_MODEL`, `CODEX_AUTH_JSON`, `CODEX_SANDBOX`, `CODEX_CONFIG`, `DEFAULT_ENGINE`, `FALLBACK_ENGINES`, `FALLBACK_PROMOTE` (turn), `FALLBACK_BACKOFF` (5m,15m,60m), `FALLBACK_LOCK_SECONDS` (120), `TOOL_PROFILE`, `MAX_CONCURRENT_JOBS` (2), `JOB_MAX_RUNTIME_SECONDS` (3600), `JOB_IDLE_TIMEOUT_SECONDS` (900), `APPROVAL_TIMEOUT_SECONDS` (1800), `MCP_WAIT_SECONDS` (20), `MCP_MAX_WAIT_SECONDS` (25), `MCP_WAIT_WITH_PROGRESS` (true), `MCP_PROGRESS_INTERVAL_SECONDS` (10), `MCP_CANCEL_ON_CANCELLED` (true), `MCP_CANCEL_ON_DISCONNECT` (true), `JOB_STATUS_NAMES` (mcp), `TASK_POLL_INTERVAL_MS` (5000), `WORKSPACE_DIR`, `GIT_REPO`, `SSH_KEY`, `SSH_KEYS_DIR`, `SSH_CONFIG`, `SSH_KNOWN_HOSTS`, `SSH_APPROVAL_HOSTS`, `APPROVAL_TOOL`, `WORKER_INSTRUCTIONS`, `REWRITE_LOOPBACK_HOST`.
+See [.env.example](.env.example). The most important settings: `CURSOR_API_KEY`, `WORKER_TOKEN`, `CURSOR_MODEL`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `OPENAI_API_KEY`, `CODEX_MODEL`, `CODEX_AUTH_JSON`, `CODEX_SANDBOX`, `CODEX_CONFIG`, `DEFAULT_ENGINE`, `FALLBACK_ENGINES`, `FALLBACK_PROMOTE` (turn), `FALLBACK_BACKOFF` (5m,15m,60m), `FALLBACK_LOCK_SECONDS` (120), `TOOL_PROFILE`, `MAX_CONCURRENT_JOBS` (2), `JOB_MAX_RUNTIME_SECONDS` (3600), `JOB_IDLE_TIMEOUT_SECONDS` (900), `APPROVAL_TIMEOUT_SECONDS` (1800), `MCP_WAIT_SECONDS` (20), `MCP_MAX_WAIT_SECONDS` (25), `MCP_WAIT_WITH_PROGRESS` (true), `MCP_PROGRESS_INTERVAL_SECONDS` (10), `MCP_PROTOCOL_MODERN` (auto), `MCP_CANCEL_ON_CANCELLED` (true), `MCP_CANCEL_ON_DISCONNECT` (true), `JOB_STATUS_NAMES` (mcp), `TASK_POLL_INTERVAL_MS` (5000), `WORKSPACE_DIR`, `GIT_REPO`, `SSH_KEY`, `SSH_KEYS_DIR`, `SSH_CONFIG`, `SSH_KNOWN_HOSTS`, `SSH_APPROVAL_HOSTS`, `APPROVAL_TOOL`, `WORKER_INSTRUCTIONS`, `REWRITE_LOOPBACK_HOST`.
 
 ## Development
 

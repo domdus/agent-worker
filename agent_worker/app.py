@@ -21,6 +21,7 @@ from agent_worker.engine import CursorEngine, Engine
 from agent_worker.images import parse_images
 from agent_worker.jobs import JobError, JobManager, JobRequest, Store
 from agent_worker.mcp_config import DEPTH_HEADER, parse_depth
+from agent_worker.mcp_http import ModernProtocolShim
 from agent_worker.mcp_server import build_mcp
 from agent_worker.settings import LOOPBACK_HOSTS, Settings
 from agent_worker.version import VERSION
@@ -614,7 +615,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
 
     app.include_router(openai_compat.router)
     # Last: everything not matched above goes to the MCP app, which only answers /mcp.
-    app.mount("/", mcp_app)
+    # The 2026-07-28 path: tolerant of proxies that drop MCP headers, or off (MCP_PROTOCOL_MODERN).
+    app.mount("/", ModernProtocolShim(mcp_app, settings.mcp_protocol_modern))
     return app
 
 

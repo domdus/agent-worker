@@ -40,6 +40,12 @@ def _patterns(raw: str) -> tuple[str, ...]:
     return tuple(item.strip().lower() for item in raw.replace("\n", ",").split(",") if item.strip())
 
 
+def _modern(raw: str) -> str:
+    """MCP_PROTOCOL_MODERN: auto (default) or off (also false/0/no/disabled)."""
+    value = (raw or "").strip().lower()
+    return "off" if value in {"off", "false", "0", "no", "disabled", "legacy"} else "auto"
+
+
 def _engine(raw: str) -> str:
     value = (raw or "").strip().lower()
     return value if value in ENGINES else ""
@@ -95,6 +101,11 @@ class Settings:
     # instead of returning after MCP_WAIT_SECONDS. false: the old behaviour for every client.
     mcp_wait_with_progress: bool = True
     mcp_progress_interval: int = 10
+    # MCP 2026-07-28 ("modern", per-request envelope, no initialize/session): "auto" serves it next to the
+    # initialize-era versions (and repairs routing headers a proxy dropped), "off" answers every
+    # 2026-07-28 request with UNSUPPORTED_PROTOCOL_VERSION naming the handshake versions, so clients fall
+    # back to initialize + Mcp-Session-Id.
+    mcp_protocol_modern: str = "auto"
     # What `status` reports: "mcp" (MCP Task vocabulary: queued, working, input_required, completed, failed,
     # cancelled) or "legacy" (names before 0.5.0: queued, running, needs_approval, succeeded, failed,
     # cancelled). legacy_status always carries the old name, filters accept both.
@@ -211,6 +222,7 @@ class Settings:
             mcp_cancel_on_disconnect=_bool("MCP_CANCEL_ON_DISCONNECT", True),
             mcp_wait_with_progress=_bool("MCP_WAIT_WITH_PROGRESS", True),
             mcp_progress_interval=_int("MCP_PROGRESS_INTERVAL_SECONDS", 10, 1),
+            mcp_protocol_modern=_modern(os.environ.get("MCP_PROTOCOL_MODERN", "")),
             job_status_names=_status_names(os.environ.get("JOB_STATUS_NAMES", "")),
             task_poll_interval_ms=_int("TASK_POLL_INTERVAL_MS", 5000, 500),
             max_call_depth=_int("MAX_CALL_DEPTH", 1, 1),
