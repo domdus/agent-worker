@@ -35,7 +35,7 @@ CURSOR_MODEL=composer-2.5
 ```yaml
 services:
   agent-worker:
-    image: ghcr.io/domdus/agent-worker:latest   # or pin a version, e.g. :0.7.0
+    image: ghcr.io/domdus/agent-worker:latest   # or pin a version, e.g. :0.7.1
     container_name: agent-worker
     env_file: .env
     ports:
@@ -402,9 +402,9 @@ FALLBACK_LOCK_SECONDS=120                      # optional: anti-flapping lock
 
 **Handoff.** Sessions do not carry over between engines. The engine that takes over gets the original task, the conversation of the session so far, a journal of the tool calls and commands already executed (with their results, as far as the engine reported them), the workspace's uncommitted files and new commits, and the partial answer, with the explicit instruction not to repeat side-effecting steps (file writes, commits, pushes, ssh commands, deployments) but to check the state and go on. The journal is kept in memory only; tool output never goes into the stored events.
 
-**Visibility.** Each switch is a step, so `status_message` / `last_step` show it, e.g. `claude am Limit (Reset 18:30) – cursor übernimmt`, and `/v1` streams show it as a thinking line (`reasoning_content`). The result has `engines_used` (e.g. `["claude", "cursor"]`) and `fallback` (every try: engine, model, status `handed_off` / `skipped` / `completed` / `failed`, reason); `/v1` answers have `agent_worker.engines_used`. A last step `Engines: claude → cursor` is added when more than one ran. `GET /health` → `fallback` shows the chain and which engines are blocked until when.
+**Visibility.** Each switch is a step, so `status_message` / `last_step` show it, e.g. `claude at its usage limit (reset 18:30) – cursor takes over` (in the user's language over MCP progress and `/v1`, see [Languages](#languages)), and `/v1` streams show it as a thinking line (`reasoning_content`). The result has `engines_used` (e.g. `["claude", "cursor"]`) and `fallback` (every try: engine, model, status `handed_off` / `skipped` / `completed` / `failed`, reason); `/v1` answers have `agent_worker.engines_used`. A last step `Engines: claude → cursor` is added when more than one ran. `GET /health` → `fallback` shows the chain and which engines are blocked until when.
 
-**No engine left.** The job goes to `queued` with `waiting_for: "engine"` and a message like `Keine Engine frei (claude am Limit (Reset 18:30); cursor nicht angemeldet) – Job wartet und geht um 18:30 automatisch weiter`. It gives its `MAX_CONCURRENT_JOBS` slot back (it keeps its workspace lock), looks again at the known reset time or every 60 s (an engine may get signed in), and then goes on from the top of the chain. Waiting does not count towards `JOB_MAX_RUNTIME_SECONDS`. A cancel ends it as usual.
+**No engine left.** The job goes to `queued` with `waiting_for: "engine"` and a message like `No engine available (claude at its usage limit (reset 18:30); cursor not signed in) – the job waits and goes on automatically at 18:30`. It gives its `MAX_CONCURRENT_JOBS` slot back (it keeps its workspace lock), looks again at the known reset time or every 60 s (an engine may get signed in), and then goes on from the top of the chain. Waiting does not count towards `JOB_MAX_RUNTIME_SECONDS`. A cancel ends it as usual.
 
 **Back up to the preferred engine (promotion).** Only at the start of a job (a turn), never in the middle of a run, and always from the top of the chain. A blocked engine is not tried before its known reset time; failures without one (connection errors, 5xx, 429 without a time, auth) block it for the next `FALLBACK_BACKOFF` step (every failure in a row takes the next step; a success clears it). The probe is cheap: the engine's sign-in status, no model prompt. A new sign-in (`/auth/...`) lifts an auth block at once. `FALLBACK_LOCK_SECONDS` is the shortest block, and a session that just switched stays put that long (no flapping). An engine that comes back for a session gets the session's conversation, since its own session there is stale.
 
@@ -540,11 +540,18 @@ Jobs in different workspaces run in parallel (up to `MAX_CONCURRENT_JOBS`); in o
 
 - `agent_run` with `_meta: {"progressToken": <unique token>, "io.github.domdus/conversation_id": "<conversation id>"}` on every call. The conversation id is an opaque id such as the chat's UUID, not a token.
 - With the `progressToken`, wait for the call's result and reset the call's timeout on every `notifications/progress` (keepalive at least every `MCP_PROGRESS_INTERVAL_SECONDS`, 10 s). Show the progress `message` (last step) if you like.
+- Send the user's language as `Accept-Language` on the MCP HTTP requests (e.g. `de-DE,de;q=0.9`): the approval question, its form and the progress messages come in that language ([Languages](#languages)).
 - Declare the `elicitation` capability in `initialize` and show `elicitation/create` requests to the **user** (not the model): that is how the worker asks for approvals of commands on approval hosts. Without it, approvals go through `POST /jobs/<id>/approve` or `agent_approve`.
 - When the user presses stop: send `notifications/cancelled` for the open `agent_run` call (most MCP SDKs do this when the call is cancelled), **and** `agent_cancel(conversation_id="<conversation id>")`, which also catches jobs whose `agent_run` call has already returned a `job_id`.
 - Without a `progressToken` (older clients): if the answer has a `job_id` and `status` `queued`/`working`, poll `agent_job(job_id, wait_seconds=20)` about every `task.pollInterval` ms until the status is `completed`, `failed` or `cancelled`. Treat `input_required` as "ask the user" (or answer the elicitation the worker sends).
 - Compare `status` against the MCP names; read `legacy_status` only if you still need the old ones.
 - For work that must outlive the chat (a long refactor the user walks away from), set `background: true`.
+
+### Languages
+
+Texts the worker shows to **people** follow the standard `Accept-Language` header of the request: on MCP (HTTP transport) the approval question by elicitation (message, the form's titles and descriptions), the progress messages (`job <id>: …`, steps, what the job waits for, the final status with the reason it was stopped), and on `/v1/chat/completions` the approval question with its reply hint, the thinking lines and the error text of a stopped job. Supported are the 15 languages of AI Workspace: `en`, `de`, `nl`, `fr`, `es`, `it`, `pl`, `cs`, `sv`, `ru`, `ko`, `zh-Hans`, `zh-Hant`, `az`, `eo` (`zh-CN`/`zh-SG` → `zh-Hans`, `zh-TW`/`zh-HK`/`zh-MO` → `zh-Hant`, regions are ignored otherwise); anything else, or no header, is English.
+
+Unchanged in every language: commands, hosts, job ids, engine names, setting names, endpoints, the reply words **approve**/**deny** (plain yes/no words of these languages work too), and everything machine-readable: status names (a localized progress message keeps the status, e.g. `abgeschlossen (completed)`), JSON keys and the tool results. Tool descriptions, server instructions and hints for the calling model stay English, as do stored events, `status_message`, `error` and the job API. Engine error messages are passed on as the engine wrote them. Status events carry their text as an `i18n` key with parameters (`agent_worker/i18n.py`).
 
 ## Job API
 

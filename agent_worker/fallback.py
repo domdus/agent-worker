@@ -33,6 +33,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from agent_worker import i18n
+
 logger = logging.getLogger(__name__)
 
 PROMOTE_MODES = ("turn", "reset", "off")
@@ -346,17 +348,24 @@ def clock(stamp: float | None) -> str:
     return at.strftime("%d.%m. %H:%M")
 
 
+def describe_msg(engine: str, failure: Failure) -> i18n.Msg:
+    """'claude at its usage limit (reset 18:30)' and the like, for status lines (rendered per language)."""
+    reset = i18n.msg("fb.reset", time=clock(failure.reset_at)) if failure.reset_at else ""
+    key = {
+        LIMIT: "fb.limit",
+        RATE_LIMIT: "fb.rate_limit",
+        AUTH: "fb.auth",
+        TIMEOUT: "fb.timeout",
+        CONNECTION: "fb.connection",
+        SERVER: "fb.server",
+    }.get(failure.kind, "fb.failed")
+    params = {"reset": reset} if key in {"fb.limit", "fb.rate_limit"} else {}
+    return i18n.msg(key, engine=engine, **params)
+
+
 def describe(engine: str, failure: Failure) -> str:
-    """'claude am Limit (Reset 18:30)' and the like, for status lines."""
-    reset = f" (Reset {clock(failure.reset_at)})" if failure.reset_at else ""
-    return {
-        LIMIT: f"{engine} am Limit{reset}",
-        RATE_LIMIT: f"{engine} Rate-Limit (429){reset}",
-        AUTH: f"{engine} nicht angemeldet / Anmeldung abgelaufen",
-        TIMEOUT: f"{engine} Zeitüberschreitung",
-        CONNECTION: f"{engine} nicht erreichbar (Verbindungsfehler)",
-        SERVER: f"{engine} überlastet / Serverfehler",
-    }.get(failure.kind, f"{engine} ausgefallen")
+    """describe_msg() in English (attempt reasons, logs, the handoff to the next engine)."""
+    return i18n.english(describe_msg(engine, failure))
 
 
 # ---- engine health ----------------------------------------------------------------------------
@@ -450,16 +459,20 @@ class EngineHealth:
     def state(self, engine: str) -> _State | None:
         return self._states.get(engine)
 
-    def note(self, engine: str) -> str:
-        """Why an engine is blocked ('claude am Limit (Reset 18:30)'), or ''."""
+    def note_msg(self, engine: str) -> i18n.Msg | None:
+        """Why an engine is blocked ('claude at its usage limit (reset 18:30)'), or None."""
         state = self._states.get(engine)
         if state is None or not self.blocked_until(engine):
-            return ""
+            return None
         failure = Failure(state.kind, state.reason, state.blocked_until if state.reset_known else None)
-        text = describe(engine, failure)
+        text = describe_msg(engine, failure)
         if not state.reset_known:
-            text += f", nächster Versuch {clock(state.blocked_until)}"
+            return i18n.msg("fb.with_next_try", note=text, next=i18n.msg("fb.next_try", time=clock(state.blocked_until)))
         return text
+
+    def note(self, engine: str) -> str:
+        """note_msg() in English, or ''."""
+        return i18n.english(self.note_msg(engine))
 
     def overview(self) -> dict[str, Any]:
         return {name: {**state.as_dict(), "blocked": bool(self.blocked_until(name))}

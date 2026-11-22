@@ -25,7 +25,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from agent_worker import cursor_auth
+from agent_worker import cursor_auth, i18n
 from agent_worker.images import parse_image
 from agent_worker.jobs import Job, JobError, JobManager, JobRequest
 from agent_worker.mcp_config import DEPTH_HEADER, parse_depth
@@ -48,8 +48,12 @@ _CONTEXT_CHARS = 60_000
 _SESSION_HEADERS = ("x-openwebui-chat-id", "x-session-id", "x-agent-session", "x-conversation-id", "x-chat-id")
 _SESSION_FIELDS = ("session_id", "conversation_id", "chat_id")
 _NOT_A_SESSION = {"new", "null", "none", "undefined", "false", "0"}
-_YES = {"approve", "approved", "yes", "y", "ok", "okay", "allow", "go", "go ahead", "continue", "ja", "jawohl"}
-_NO = {"deny", "denied", "no", "n", "stop", "cancel", "abort", "nein"}
+# approve/deny are the commands the prompt names (in every language); plain yes/no words of the supported
+# languages work too.
+_YES = {"approve", "approved", "yes", "y", "ok", "okay", "allow", "go", "go ahead", "continue", "ja", "jawohl",
+        "oui", "sí", "si", "sì", "tak", "ano", "да", "네", "예", "是", "好", "允许", "允許", "同意", "bəli", "hə", "jes"}
+_NO = {"deny", "denied", "no", "n", "stop", "cancel", "abort", "nein", "nee", "nej", "non", "nie", "ne", "нет",
+       "아니요", "아니오", "否", "不", "拒绝", "拒絕", "xeyr", "yox"}
 
 
 def decision_word(text: str) -> bool | None:
@@ -61,14 +65,26 @@ def decision_word(text: str) -> bool | None:
     return None
 
 
-def approval_prompt(job: Job) -> str:
+def approval_prompt(job: Job, lang: str = i18n.DEFAULT) -> str:
     item = job.pending_approval or {}
     target = f"{item.get('user')}@{item.get('host')}" if item.get("user") else str(item.get("host") or "?")
-    command = str(item.get("command") or "").strip() or "(interactive session or file transfer)"
+    command = str(item.get("command") or "").strip() or i18n.t(lang, "approval.no_command")
     return (
-        f"\n\n**Approval needed:** `{item.get('tool', 'ssh')}` on **{target}**\n\n```\n{command}\n```\n\n"
-        "Reply **approve** to run it or **deny** to stop."
+        "\n\n" + i18n.t(lang, "chat.approval_needed", tool=item.get("tool", "ssh"), target=target)
+        + f"\n\n```\n{command}\n```\n\n" + i18n.t(lang, "chat.approval_reply")
     )
+
+
+def request_lang(request: Request) -> str:
+    """The language for texts to the user: the request's Accept-Language header (English without one)."""
+    return i18n.from_headers(request.headers)
+
+
+def _error_text(job: Job, lang: str, fallback_key: str) -> str:
+    """Why the job ended, for the user: the worker's own reason in lang, an engine's error as it is."""
+    if job.error_i18n and lang != i18n.DEFAULT:
+        return i18n.render(lang, job.error_i18n)
+    return job.error or i18n.t(lang, fallback_key)
 
 
 def split_model(raw: str) -> tuple[str, str]:
@@ -272,13 +288,13 @@ def _usage(job: Job) -> dict[str, int]:
     return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
 
 
-def _answer(job: Job) -> str:
+def _answer(job: Job, lang: str = i18n.DEFAULT) -> str:
     if job.status == COMPLETED:
         return job.result
     if job.status == CANCELLED:
-        return job.result or "(cancelled)"
-    detail = job.error or "The agent failed."
-    return f"{job.result}\n\n**Agent worker error:** {detail}".strip()
+        return job.result or i18n.t(lang, "chat.cancelled")
+    detail = _error_text(job, lang, "chat.agent_failed")
+    return f"{job.result}\n\n{i18n.t(lang, 'chat.worker_error', detail=detail)}".strip()
 
 
 class ChunkWriter:
@@ -338,6 +354,7 @@ async def sse_reply(
     after: int = 0,
     steps: str = "reasoning_content",
     disconnected: Callable[[], Awaitable[bool]] | None = None,
+    lang: str = i18n.DEFAULT,
 ) -> AsyncIterator[str]:
     """The job's live events as an OpenAI chat stream. If the stream ends before the job does (the client
     went away, or pressed stop), the job is cancelled."""
@@ -352,7 +369,7 @@ async def sse_reply(
             kind = event.get("type")
             if kind == "approval":
                 # End this reply with the question; the job waits. The user's next message answers it.
-                yield out.chunk({"content": approval_prompt(job)})
+                yield out.chunk({"content": approval_prompt(job, lang)})
                 for line in out.finish(_usage(job)):
                     yield line
                 finished = True
@@ -363,7 +380,7 @@ async def sse_reply(
                     streamed = True
                     yield out.chunk({"content": delta})
             elif kind in {"tool", "status"} and steps != "none":
-                line = str(event.get("text") or "").strip()
+                line = (i18n.event_text(event, lang) if event.get("text") else "").strip()
                 if line and line != last_step:
                     last_step = line
                     yield out.chunk({steps: line + "\n"})
@@ -380,9 +397,9 @@ async def sse_reply(
             if not streamed and job.result:
                 yield out.chunk({"content": job.result})
             if job.status == CANCELLED:
-                yield out.error(job.error or "The job was cancelled.", "agent_cancelled", "cancelled")
+                yield out.error(_error_text(job, lang, "chat.job_cancelled"), "agent_cancelled", "cancelled")
             else:
-                yield out.error(job.error or "The agent failed.", "agent_error", job.public_status())
+                yield out.error(_error_text(job, lang, "chat.agent_failed"), "agent_error", job.public_status())
             yield out.done()
         finished = True
     finally:
@@ -441,7 +458,7 @@ async def chat_completions(request: Request):
     if paused is not None:
         answer = decision_word(task)
         if answer is None:
-            return _reply(body, paused, approval_prompt(paused).strip())
+            return _reply(body, paused, approval_prompt(paused, request_lang(request)).strip())
         manager.decide(paused.id, answer, "" if answer else "denied in chat")
         await asyncio.sleep(0)
         return await _respond(request, manager, body, paused, after=len(paused.events))
@@ -533,14 +550,15 @@ async def _respond(request: Request, manager: JobManager, body: dict, job: Job, 
         if not await _wait_or_leave(request, manager, job):
             return _error_response(499, "The client closed the request; the job was cancelled.", "agent_cancelled")
         if job.status == INPUT_REQUIRED:
-            return _reply(body, job, (job.result or "") + approval_prompt(job))
-        return _completion(cid, shown, _answer(job), _usage(job),
+            return _reply(body, job, (job.result or "") + approval_prompt(job, request_lang(request)))
+        return _completion(cid, shown, _answer(job, request_lang(request)), _usage(job),
                            {"agent_worker": {"job_id": job.id, "status": job.public_status(), "changes": job.changes,
                                              **_engines(job)}})
 
     steps = steps_mode(request.headers.get("x-agent-steps")) or manager.settings.openai_steps
     out = ChunkWriter(cid, shown, _include_usage(body))
-    return _sse_response(sse_reply(manager, job, out, after=after, steps=steps, disconnected=request.is_disconnected))
+    return _sse_response(sse_reply(manager, job, out, after=after, steps=steps, disconnected=request.is_disconnected,
+                                   lang=request_lang(request)))
 
 
 async def _respond_json(request: Request, manager: JobManager, body: dict, job: Job, fmt: dict, cid: str,
@@ -564,7 +582,8 @@ async def _respond_json(request: Request, manager: JobManager, body: dict, job: 
 
     steps = steps_mode(request.headers.get("x-agent-steps")) or manager.settings.openai_steps
     out = ChunkWriter(cid, shown, _include_usage(body))
-    return _sse_response(sse_json_reply(manager, job, out, fmt, steps=steps, disconnected=request.is_disconnected))
+    return _sse_response(sse_json_reply(manager, job, out, fmt, steps=steps, disconnected=request.is_disconnected,
+                                        lang=request_lang(request)))
 
 
 async def sse_json_reply(
@@ -575,6 +594,7 @@ async def sse_json_reply(
     *,
     steps: str = "reasoning_content",
     disconnected: Callable[[], Awaitable[bool]] | None = None,
+    lang: str = i18n.DEFAULT,
 ) -> AsyncIterator[str]:
     """JSON mode as a stream: steps live (as reasoning), the answer's text held back; once the job ends,
     one content chunk with the JSON, or an error chunk. A stream that ends early cancels the job."""
@@ -589,7 +609,7 @@ async def sse_json_reply(
             if kind == "approval":
                 break
             if kind in {"tool", "status"} and steps != "none":
-                line = str(event.get("text") or "").strip()
+                line = (i18n.event_text(event, lang) if event.get("text") else "").strip()
                 if line and line != last_step:
                     last_step = line
                     yield out.chunk({steps: line + "\n"})

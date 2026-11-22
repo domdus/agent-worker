@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 
+from agent_worker import i18n
 from agent_worker import openai_compat
 from agent_worker.auth import KEY_UPDATES, LOGIN_STARTS, RateLimit
 from agent_worker.engine import CursorEngine, Engine
@@ -536,7 +537,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     @app.post("/conversations/{conversation_id}/cancel")
     async def cancel_conversation(conversation_id: str) -> dict[str, Any]:
         """Cancel every queued and running job of one client conversation (agent_cancel conversation_id=...)."""
-        jobs = manager.cancel_conversation(conversation_id, "Cancelled (conversation cancel).")
+        jobs = manager.cancel_conversation(
+            conversation_id, i18n.msg("reason.cancelled_via", via="conversation cancel"))
         await asyncio.gather(*(manager.wait(job, 15) for job in jobs))
         return {"conversation_id": conversation_id.strip(), "cancelled": [manager.describe(job) for job in jobs]}
 
