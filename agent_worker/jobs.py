@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from agent_worker import fallback as fb
+from agent_worker import i18n
 from agent_worker import proctree
 from agent_worker import tasks as st
 from agent_worker.engine import JOB_ENV, Engine, EngineError, Outcome, RunSpec, git_changes, git_head
@@ -65,6 +66,12 @@ def _parse(stamp: str) -> datetime | None:
         return datetime.fromisoformat(stamp) if stamp else None
     except ValueError:
         return None
+
+
+def _step(key: str, **params: Any) -> dict[str, Any]:
+    """A status event: English text (stored, for the API and the model), the i18n message for people."""
+    message = i18n.msg(key, **params)
+    return {"type": "status", "text": i18n.english(message), "i18n": message}
 
 
 def _short(text: str, limit: int) -> str:
@@ -222,6 +229,10 @@ class Job:
     journal: list[dict[str, Any]] = field(default_factory=list, repr=False)
     # While queued for an engine (waiting_for == "engine"): why, and when it goes on.
     wait_note: str = ""
+    # The same texts as i18n messages, rendered per language for people (MCP progress, /v1 chat); in memory.
+    wait_i18n: dict[str, Any] | None = field(default=None, repr=False)
+    stop_i18n: dict[str, Any] | None = field(default=None, repr=False)
+    error_i18n: dict[str, Any] | None = field(default=None, repr=False)
 
     @property
     def done(self) -> bool:
@@ -234,36 +245,40 @@ class Job:
     def public_status(self) -> str:
         return st.legacy(self.status) if self.legacy_names else self.status
 
-    def status_message(self, blocked_by: str | None = None) -> str:
-        """What the status means right now, for people and for the MCP Task statusMessage."""
+    def status_message(self, blocked_by: str | None = None, lang: str = i18n.DEFAULT) -> str:
+        """What the status means right now, for people and for the MCP Task statusMessage.
+
+        lang: the reader's language (i18n); the status name in front and commands stay as they are."""
         if self.status == st.QUEUED and self.waiting_for == "engine":
-            return "queued: " + (self.wait_note or "waiting for an engine")
+            note = i18n.render(lang, self.wait_i18n) if self.wait_i18n else self.wait_note
+            return "queued: " + (note or i18n.t(lang, "queue.engine"))
         if self.status == st.QUEUED:
-            what = {"workspace": "another job in this workspace", "session": "another job in this session",
-                    "slot": "a free slot (MAX_CONCURRENT_JOBS)"}.get(self.waiting_for, "its start")
-            return f"queued: waiting for {what}" + (f" (job {blocked_by})" if blocked_by else "")
+            key = {"workspace": "queue.workspace", "session": "queue.session", "slot": "queue.slot"}.get(
+                self.waiting_for, "queue.start")
+            return "queued: " + i18n.t(lang, key) + (f" (job {blocked_by})" if blocked_by else "")
         if self.status == st.INPUT_REQUIRED:
             approval = self.pending_approval or {}
             if not approval:
-                return "input_required: waiting for a human answer"
+                return "input_required: " + i18n.t(lang, "input.answer")
             target = f"{approval.get('user')}@{approval.get('host')}" if approval.get("user") else approval.get("host")
             command = _short(approval.get("command") or "", 160)
-            return (f"input_required: waiting for a human to approve {approval.get('tool', 'ssh')} on {target}"
-                    + (f": {command}" if command else "") + " (POST /jobs/{id}/approve or MCP elicitation)").replace(
-                        "{id}", self.id)
+            return ("input_required: " + i18n.t(lang, "input.approve", tool=approval.get("tool", "ssh"), target=target)
+                    + (f": {command}" if command else "") + " " + i18n.t(lang, "input.how", job=self.id))
         if self.status == st.WORKING:
-            step, _ = self.last_step()
-            return step or "working"
+            step, _ = self.last_step(lang)
+            return step or i18n.t(lang, "progress.working")
         if self.status == st.COMPLETED:
             return _short(self.result, 200) or "completed"
+        if self.error_i18n and lang != i18n.DEFAULT:
+            return _short(i18n.render(lang, self.error_i18n), 300)
         return _short(self.error, 300) or self.status
 
-    def last_step(self) -> tuple[str, str]:
+    def last_step(self, lang: str = i18n.DEFAULT) -> tuple[str, str]:
         """(text, at) of the latest step (tool call, status, error, approval) and the time of the latest event."""
         step = ""
         for event in reversed(self.events):
             if event.get("type") in _STEP_TYPES:
-                step = str(event.get("text") or event.get("message") or "")
+                step = i18n.event_text(event, lang)
                 if step:
                     break
         last = self.events[-1].get("at", "") if self.events else ""
@@ -592,7 +607,8 @@ class JobManager:
     def _settle(self, job: Job) -> None:
         """A task cancelled before its first step never enters _run; close the job here."""
         if not job.done:
-            self._finish(job, st.CANCELLED, error=job.stop_reason or "Cancelled before it started.")
+            reason = job.stop_i18n if job.stop_reason else i18n.msg("reason.not_started")
+            self._finish(job, st.CANCELLED, error=job.stop_reason or i18n.english(reason), error_i18n=reason)
 
     def _finish(self, job: Job, status: str, **fields: Any) -> None:
         if job.approval_future is not None and not job.approval_future.done():
@@ -630,10 +646,9 @@ class JobManager:
                 if lock.locked():
                     job.waiting_for, job.waiting_key = key[0], key
                     holder = self._holders.get(key, "")
-                    where = "this workspace" if key[0] == "workspace" else "this session"
-                    await self._emit(
-                        job, {"type": "status", "text": f"Waiting for another job in {where} ({holder or '?'})..."}
-                    )
+                    step = i18n.msg("step.wait_workspace" if key[0] == "workspace" else "step.wait_session",
+                                    holder=holder or "?")
+                    await self._emit(job, {"type": "status", "text": i18n.english(step), "i18n": step})
                 await lock.acquire()
                 job.held.append(key)
                 self._holders[key] = job.id
@@ -645,7 +660,7 @@ class JobManager:
                 job.started_at = _now()
                 job.started_clock = job.activity_clock = loop.time()
                 self.store.save(job)
-                await self._emit(job, {"type": "status", "text": "Running"})
+                await self._emit(job, _step("step.running"))
                 try:
                     if self.fallback_on:
                         outcome = await self._run_chain(job, spec, slot)
@@ -653,9 +668,10 @@ class JobManager:
                         outcome = await self._supervise(job, spec)
                 except _Stopped:
                     status, message = job.stop_status or st.CANCELLED, job.stop_reason or "Cancelled."
+                    reason = job.stop_i18n if job.stop_reason else i18n.msg("reason.cancelled")
                     await self._emit(job, {"type": "error" if status == st.FAILED else "status", "message": message,
-                                           "text": message})
-                    self._finish(job, status, error=message)
+                                           "text": message, **({"i18n": reason} if reason else {})})
+                    self._finish(job, status, error=message, error_i18n=reason)
                     await self._cleanup(job, job.spec or spec)
                     return
             finally:
@@ -675,15 +691,16 @@ class JobManager:
             status = st.normalize(outcome.status) or st.FAILED
             used = job.engines_used()
             if len(used) > 1:
-                await self._emit(job, {"type": "status", "text": "Engines: " + " → ".join(used)})
+                await self._emit(job, _step("step.engines", engines=" → ".join(used)))
             if status == st.COMPLETED:
                 await self._emit(job, {"type": "result", "text": outcome.text})
             else:
                 await self._emit(job, {"type": "error", "message": outcome.error})
             self._finish(job, status, **fields)
         except asyncio.CancelledError:
-            await self._emit(job, {"type": "status", "text": "Cancelled"})
-            self._finish(job, st.CANCELLED, error=job.stop_reason or job.error or "Cancelled.")
+            await self._emit(job, _step("step.cancelled"))
+            reason = job.stop_i18n if job.stop_reason else (None if job.error else i18n.msg("reason.cancelled"))
+            self._finish(job, st.CANCELLED, error=job.stop_reason or job.error or "Cancelled.", error_i18n=reason)
         except EngineError as exc:
             await self._emit(job, {"type": "error", "message": str(exc)})
             self._finish(job, st.FAILED, error=str(exc))
@@ -713,10 +730,7 @@ class JobManager:
     async def _take_slot(self, job: Job, slot: _Slot) -> None:
         if self._slots.locked():
             job.waiting_for, job.waiting_key = "slot", ()
-            await self._emit(
-                job,
-                {"type": "status", "text": f"Waiting for a free slot (MAX_CONCURRENT_JOBS={self.settings.max_concurrent_jobs})..."},
-            )
+            await self._emit(job, _step("step.wait_slot", limit=self.settings.max_concurrent_jobs))
         await slot.acquire()
 
     def _chain(self, spec: RunSpec) -> list[tuple[str, str]]:
@@ -798,28 +812,29 @@ class JobManager:
             return index, name, model
         return None
 
-    def _wait_note(self, chain: list[tuple[str, str]]) -> tuple[str, float | None]:
-        notes, wake = [], None
+    def _wait_note(self, chain: list[tuple[str, str]]) -> tuple[dict[str, Any], float | None]:
+        notes: list[Any] = []
+        wake = None
         for name, _ in chain:
             if not self._ready(name):
-                notes.append(f"{name} nicht angemeldet")
+                notes.append(i18n.msg("fb.not_signed_in", engine=name))
                 continue
             until = self.health.blocked_until(name)
             if until:
-                notes.append(self.health.note(name))
+                notes.append(self.health.note_msg(name) or name)
                 wake = until if wake is None else min(wake, until)
-        when = (f"geht um {fb.clock(wake)} automatisch weiter" if wake
-                else "geht automatisch weiter, sobald eine Engine angemeldet ist")
-        return f"Keine Engine frei ({'; '.join(notes)}) – Job wartet und {when}", wake
+        when = (i18n.msg("wait.resume_at", time=fb.clock(wake)) if wake else i18n.msg("wait.resume_signin"))
+        return i18n.msg("wait.no_engine", notes=notes, when=when), wake
 
     async def _wait_for_engine(self, job: Job, chain: list[tuple[str, str]], slot: _Slot) -> None:
         """No engine of the chain can run: wait (without a slot) until one can, instead of failing."""
         loop = asyncio.get_running_loop()
-        note, wake = self._wait_note(chain)
-        job.wait_note, job.waiting_for, job.waiting_key = note, "engine", ()
+        message, wake = self._wait_note(chain)
+        note = i18n.english(message)
+        job.wait_note, job.wait_i18n, job.waiting_for, job.waiting_key = note, message, "engine", ()
         job.set_status(st.QUEUED)
         self.store.save(job)
-        await self._emit(job, {"type": "status", "text": note})
+        await self._emit(job, {"type": "status", "text": note, "i18n": message})
         logger.info("job %s waits for an engine: %s", job.id, note)
         slot.release()
         paused = loop.time()
@@ -837,12 +852,12 @@ class JobManager:
                 if any(self._ready(name) and not self.health.blocked_until(name) for name, _ in chain):
                     break
                 fresh, wake = self._wait_note(chain)
-                if fresh != job.wait_note:
-                    job.wait_note = fresh
+                if i18n.english(fresh) != job.wait_note:
+                    job.wait_note, job.wait_i18n = i18n.english(fresh), fresh
                     job.changed.set()
             await self._take_slot(job, slot)
         finally:
-            job.wait_note = ""
+            job.wait_note, job.wait_i18n = "", None
         if job.stop.is_set():
             slot.release()
             raise _Stopped()
@@ -853,7 +868,7 @@ class JobManager:
         job.waiting_for, job.waiting_key = "", ()
         job.set_status(st.WORKING)
         self.store.save(job)
-        await self._emit(job, {"type": "status", "text": "Engine wieder verfügbar – Job geht weiter"})
+        await self._emit(job, _step("step.engine_back"))
 
     def _forget(self, name: str, spec: RunSpec) -> None:
         """The engine's own session for this conversation is stale (it missed turns on another engine)."""
@@ -894,7 +909,7 @@ class JobManager:
             if first and last and name != last:
                 names = [n for n, _ in chain]
                 if last in names and names.index(name) < names.index(last):
-                    await self._emit(job, {"type": "status", "text": f"{name} wieder verfügbar – zurück von {last} zu {name}"})
+                    await self._emit(job, _step("step.promoted", engine=name, previous=last))
             first = False
             job.engine, job.model = name, model or self.default_model(name)
             job.spec = run
@@ -924,7 +939,8 @@ class JobManager:
                     return outcome
             # Provider-side failure: block the engine, hand the job to the next one.
             self.health.mark_failed(name, failure)
-            reason = fb.describe(name, failure)
+            reason_msg = fb.describe_msg(name, failure)
+            reason = i18n.english(reason_msg)
             job.attempts[-1] = {**attempt.as_dict(), "status": "handed_off", "reason": reason,
                                 "kind": failure.kind, "finished_at": _now()}
             logger.info("job %s: %s (%s)", job.id, reason, failure.message)
@@ -943,31 +959,28 @@ class JobManager:
                 await self._emit(job, {"type": "text", "delta": "\n\n"})
             following = self._next_engine(job, chain, index + 1, noted)
             if following is not None:
-                text = f"{reason} – {following[1]} übernimmt"
+                await self._emit(job, _step("step.handoff", reason=reason_msg, engine=following[1]))
             else:
-                text = f"{reason} – keine weitere Engine frei"
-            await self._emit(job, {"type": "status", "text": text})
+                await self._emit(job, _step("step.no_engine_left", reason=reason_msg))
             start = index + 1
 
-    def _overdue(self, job: Job, now: float) -> tuple[str, str] | None:
-        """(status, reason) when a watchdog limit is past, else None."""
+    def _overdue(self, job: Job, now: float) -> tuple[str, dict[str, Any]] | None:
+        """(status, reason as an i18n message) when a watchdog limit is past, else None."""
         settings = self.settings
         if job.status == st.INPUT_REQUIRED:
             if job.approval_clock and now - job.approval_clock >= settings.approval_timeout:
                 return st.CANCELLED, self._approval_timeout_reason(job)
         elif settings.job_idle_timeout > 0 and now - job.activity_clock >= settings.job_idle_timeout:
-            return st.FAILED, (
-                f"No output or progress from the engine for {settings.job_idle_timeout} s "
-                "(JOB_IDLE_TIMEOUT_SECONDS); the job was stopped."
-            )
+            return st.FAILED, i18n.msg("reason.idle", seconds=settings.job_idle_timeout)
         if now - job.started_clock >= settings.job_timeout:
-            return st.FAILED, f"The job ran longer than JOB_MAX_RUNTIME_SECONDS ({settings.job_timeout}s) and was stopped."
+            return st.FAILED, i18n.msg("reason.runtime", seconds=settings.job_timeout)
         return None
 
-    def _approval_timeout_reason(self, job: Job) -> str:
+    def _approval_timeout_reason(self, job: Job) -> dict[str, Any]:
         approval = job.pending_approval or {}
-        what = f" for {approval.get('tool', 'ssh')} {approval.get('host', '')}".rstrip() if approval else ""
-        return f"approval timed out: no answer within {self.settings.approval_timeout} s{what} (APPROVAL_TIMEOUT_SECONDS)."
+        what = i18n.msg("reason.approval_for", tool=approval.get("tool", "ssh"), host=approval.get("host", "")) \
+            if approval else ""
+        return i18n.msg("reason.approval_timeout", seconds=self.settings.approval_timeout, what=what)
 
     def _next_check(self, job: Job, now: float) -> float:
         settings = self.settings
@@ -1042,10 +1055,13 @@ class JobManager:
             rows = [j for j in rows if j.conversation_id == conversation_id.strip()]
         return rows[: max(1, min(limit, 500))]
 
-    def request_stop(self, job: Job, status: str, reason: str) -> bool:
-        """Ask a running job to stop; it ends as `status` with `reason` as its error. The first reason wins."""
+    def request_stop(self, job: Job, status: str, reason: str | dict[str, Any]) -> bool:
+        """Ask a running job to stop; it ends as `status` with `reason` as its error. The first reason wins.
+
+        reason: plain text, or an i18n.msg() (stored in English, shown to people in their language)."""
         if job.done or job.stop.is_set():
             return False
+        reason, job.stop_i18n = i18n.split(reason)
         job.stop_status, job.stop_reason = st.normalize(status) or st.CANCELLED, reason
         if job.approval_future is not None and not job.approval_future.done():
             job.approval_future.set_result((False, reason))
@@ -1053,20 +1069,21 @@ class JobManager:
         logger.info("job %s stopping: %s", job.id, reason)
         return True
 
-    def cancel(self, job_id: str, reason: str = "Cancelled.") -> Job | None:
+    def cancel(self, job_id: str, reason: str | dict[str, Any] | None = None) -> Job | None:
         job = self.jobs.get(job_id)
         if job is None:
             return None
         if job.done:
             return job
         if job.started_at:
-            self.request_stop(job, st.CANCELLED, reason)
+            self.request_stop(job, st.CANCELLED, reason or i18n.msg("reason.cancelled"))
         elif job.task_handle is not None:
-            job.stop_reason = job.stop_reason or reason
+            if not job.stop_reason:
+                job.stop_reason, job.stop_i18n = i18n.split(reason or i18n.msg("reason.cancelled"))
             job.task_handle.cancel()
         return job
 
-    def cancel_workspace(self, workspace: str, reason: str = "Cancelled.") -> list[Job]:
+    def cancel_workspace(self, workspace: str, reason: str | dict[str, Any] | None = None) -> list[Job]:
         """Cancel every job in the workspace that has not ended (queued ones first, so none starts in between)."""
         name = (workspace or "").strip().lower() or self.settings.default_workspace
         pending = [j for j in self.jobs.values() if j.workspace == name and not j.done]
@@ -1075,7 +1092,7 @@ class JobManager:
             self.cancel(job.id, reason)
         return pending
 
-    def cancel_conversation(self, conversation_id: str, reason: str = "Cancelled.") -> list[Job]:
+    def cancel_conversation(self, conversation_id: str, reason: str | dict[str, Any] | None = None) -> list[Job]:
         """Cancel every job of this conversation that has not ended (queued ones first)."""
         wanted = (conversation_id or "").strip()
         if not wanted:
@@ -1240,7 +1257,8 @@ class JobManager:
             job.approval_clock = loop.time()
             job.set_status(st.INPUT_REQUIRED)
             self.store.save(job)
-            await self._emit(job, {"type": "approval", **approval, "text": f"Approval needed: {label}"})
+            await self._emit(job, {"type": "approval", **approval, "text": f"Approval needed: {label}",
+                                   "i18n": i18n.msg("step.approval_needed", label=label)})
             logger.info("job %s waits for approval: %s", job.id, label)
             try:
                 allow, note = await asyncio.wait_for(
@@ -1248,9 +1266,10 @@ class JobManager:
                 )
             except asyncio.TimeoutError:
                 # Nobody answered: the whole job ends, it does not go on without the command.
-                note = self._approval_timeout_reason(job)
+                timed_out = self._approval_timeout_reason(job)
+                note = i18n.english(timed_out)
                 allow = False
-                self.request_stop(job, st.CANCELLED, note)
+                self.request_stop(job, st.CANCELLED, timed_out)
             finally:
                 job.approval_future = None
                 job.pending_approval = None
@@ -1261,9 +1280,9 @@ class JobManager:
                     self.store.save(job)
             if allow:
                 job.approved_hosts.add(alias.lower())
-                await self._emit(job, {"type": "status", "text": f"Approved: {alias}" + (f" ({note})" if note else "")})
+                await self._emit(job, _step("step.approved", alias=alias, note=f" ({note})" if note else ""))
                 return True, ""
-            await self._emit(job, {"type": "status", "text": f"Denied: {alias}" + (f" ({note})" if note else "")})
+            await self._emit(job, _step("step.denied", alias=alias, note=f" ({note})" if note else ""))
             return False, (
                 f"The user did not approve {tool} to {alias}"
                 + (f": {note}" if note else ".")

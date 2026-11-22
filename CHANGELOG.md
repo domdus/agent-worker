@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.1 (2026-11-22)
+
+User-facing texts in the user's language (`Accept-Language`).
+
+### Added
+
+- The worker picks the language of a request from its standard `Accept-Language` header (q-values honoured, `zh-CN`/`zh-TW` and the like mapped to `zh-Hans`/`zh-Hant`) and falls back to English. The 15 languages of AI Workspace: `en`, `de`, `nl`, `fr`, `es`, `it`, `pl`, `cs`, `sv`, `ru`, `ko`, `zh-Hans`, `zh-Hant`, `az`, `eo`.
+- MCP: the approval question by elicitation (message, form titles and descriptions of `approve`/`note`, also in the 2026-07-28 `InputRequiredResult`), the progress messages (steps, what a job waits for, asking the user, the final status with the worker's reason for a stop, e.g. `abgebrochen (cancelled): Vom MCP-Client abgebrochen …`).
+- `/v1/chat/completions`: the approval question and its `approve`/`deny` hint, the thinking lines (steps, engine switches, waiting), the error text of a job the worker stopped (cancel, `JOB_IDLE_TIMEOUT_SECONDS`, `JOB_MAX_RUNTIME_SECONDS`, `APPROVAL_TIMEOUT_SECONDS`). Plain yes/no words of these languages answer an approval too (`oui`, `да`, `是`, `nej`, …).
+- `agent_worker/i18n.py`: the message catalogue; a test checks that every key exists in every language with the same placeholders.
+
+### Changed
+
+- Stored step texts and reasons are English throughout: the engine-fallback lines of 0.6.0 were German (`claude am Limit (Reset 18:30) – cursor übernimmt`) and are now `claude at its usage limit (reset 18:30) – cursor takes over` in events, `status_message`, `fallback[].reason` and `GET /health`; German readers still see the old wording. Status events carry an additional `i18n` field (key and parameters).
+
+### Unchanged
+
+- Commands, hosts, job ids, engine and setting names, status names, JSON keys, tool results, `status_message`/`error` in the job API, tool descriptions and instructions for the model: English / as they are. Without `Accept-Language` every text is as in 0.7.0 (apart from the fallback lines above).
+
+### Upgrade notes
+
+- Image: `ghcr.io/domdus/agent-worker:0.7.1` (or `:latest`): `docker compose pull && docker compose up -d --no-build` in the compose project dir with the existing `.env`. Recreating the container stops running jobs; do it when none are open.
+- Clients that want localized texts send `Accept-Language` on their MCP HTTP / `/v1` requests; a client that sends none gets English, as before.
+
 ## 0.7.0 (2026-11-22)
 
 MCP progress for long `agent_run` calls: a client that sends a `progressToken` simply waits for the result.

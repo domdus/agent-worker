@@ -10,8 +10,9 @@ from typing import Any, Callable
 from mcp import types as mtypes
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.shared.exceptions import NoBackChannelError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
+from agent_worker import i18n
 from agent_worker import tasks as st
 from agent_worker.jobs import Job, JobError, JobManager, JobRequest, conversation_from_meta
 from agent_worker.mcp_config import DEPTH_HEADER, parse_depth
@@ -37,30 +38,69 @@ INSTRUCTIONS = (
 
 
 class ApprovalAnswer(BaseModel):
-    approve: bool = Field(description="Allow this command on that server?")
-    note: str = Field(default="", description="Optional note for the agent")
+    approve: bool = Field(title="Allow", description="Allow this command on that server?")
+    note: str = Field(default="", title="Note", description="Optional note for the agent")
 
 
+_ANSWER_MODELS: dict[str, type[BaseModel]] = {i18n.DEFAULT: ApprovalAnswer}
 _STATE = "agent-worker-approval:"
-_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "approve": {"type": "boolean", "title": "Allow", "description": "Allow this command on that server?"},
-        "note": {"type": "string", "title": "Note", "description": "Optional note for the agent"},
-    },
-    "required": ["approve"],
-}
 
 
-def _approval_message(job: Job, approval: dict[str, Any]) -> str:
+def _answer_model(lang: str) -> type[BaseModel]:
+    """ApprovalAnswer with the field titles and descriptions in lang (the field names stay)."""
+    model = _ANSWER_MODELS.get(lang)
+    if model is None:
+        model = create_model(
+            "ApprovalAnswer",
+            __base__=BaseModel,
+            approve=(bool, Field(title=i18n.t(lang, "approval.allow_title"),
+                                 description=i18n.t(lang, "approval.allow_description"))),
+            note=(str, Field(default="", title=i18n.t(lang, "approval.note_title"),
+                             description=i18n.t(lang, "approval.note_description"))),
+        )
+        _ANSWER_MODELS[lang] = model
+    return model
+
+
+def _schema(lang: str = i18n.DEFAULT) -> dict[str, Any]:
+    """The elicitation's requested schema (2026-07-28 InputRequiredResult), texts in lang."""
+    return {
+        "type": "object",
+        "properties": {
+            "approve": {"type": "boolean", "title": i18n.t(lang, "approval.allow_title"),
+                        "description": i18n.t(lang, "approval.allow_description")},
+            "note": {"type": "string", "title": i18n.t(lang, "approval.note_title"),
+                     "description": i18n.t(lang, "approval.note_description")},
+        },
+        "required": ["approve"],
+    }
+
+
+_SCHEMA = _schema()
+
+
+def _approval_message(job: Job, approval: dict[str, Any], lang: str = i18n.DEFAULT) -> str:
     target = f"{approval['user']}@{approval['host']}" if approval.get("user") else approval["host"]
-    detail = approval.get("command") or "(interactive session or file transfer)"
+    detail = approval.get("command") or i18n.t(lang, "approval.no_command")
     real = approval.get("hostname")
-    return (
-        f"Agent job {job.id} wants to run {approval['tool']} on {target}"
-        + (f" ({real})" if real and real != approval["host"] else "")
-        + f":\n\n{detail}\n\nAllow it?"
+    return i18n.t(
+        lang,
+        "approval.question",
+        job=job.id,
+        tool=approval["tool"],
+        target=target,
+        real=f" ({real})" if real and real != approval["host"] else "",
+        detail=detail,
     )
+
+
+def _lang(ctx: Context | None) -> str:
+    """The language for texts to the user: the MCP request's Accept-Language header (English without one)."""
+    try:
+        headers = ctx.headers if ctx is not None else None
+    except Exception:
+        headers = None
+    return i18n.from_headers(headers)
 
 
 def _answer_from(result: Any) -> tuple[bool, str] | None:
@@ -130,6 +170,7 @@ class _Reporter:
 
     def __init__(self, ctx: Context | None) -> None:
         self.ctx = ctx
+        self.lang = _lang(ctx)
         self.last = 0.0
         self.sent_text = ""
 
@@ -146,15 +187,26 @@ class _Reporter:
         self.sent_text = message
 
 
-def _step_text(job: Job) -> str:
+def _step_text(job: Job, lang: str = i18n.DEFAULT) -> str:
     """A short line for a progress message: the last step while working, else what the status means."""
     if job.status == st.WORKING:
         step = next(
-            (str(e.get("text") or "") for e in reversed(job.events) if e.get("type") in {"tool", "status"}),
+            (i18n.event_text(e, lang) for e in reversed(job.events) if e.get("type") in {"tool", "status"}),
             "",
         )
-        return step or "working"
-    return job.status_message()
+        return step or i18n.t(lang, "progress.working")
+    return job.status_message(lang=lang)
+
+
+def _final_text(job: Job, lang: str = i18n.DEFAULT) -> str:
+    """The last progress message: the status name (kept for clients that read it), in lang with a label,
+    and for a stopped job the reason when the worker knows it."""
+    status = job.status
+    label = i18n.t(lang, f"status.{status}") if f"status.{status}" in i18n.MESSAGES[i18n.DEFAULT] else status
+    text = status if label == status else f"{label} ({status})"
+    if job.error_i18n and status != st.COMPLETED and lang != i18n.DEFAULT:
+        text += ": " + i18n.render(lang, job.error_i18n)
+    return text
 
 
 def _depth(ctx: Context | None) -> int:
@@ -285,7 +337,8 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
 
     async def _progress(ctx: Context | None, job: Job, reporter: _Reporter | None = None) -> None:
         # The job_id goes with every progress message: a client that gives up waiting has seen it.
-        await (reporter or _Reporter(ctx)).send(job, _step_text(job))
+        reporter = reporter or _Reporter(ctx)
+        await reporter.send(job, _step_text(job, reporter.lang))
 
     def _apply(job: Job, decided: tuple[bool, str]) -> bool:
         try:
@@ -307,8 +360,10 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
         approval = job.pending_approval
         if approval is None or not _can_elicit(ctx):
             return False
-        message = _approval_message(job, approval)
-        asking = asyncio.ensure_future(asyncio.wait_for(ctx.elicit(message, ApprovalAnswer), settings.approval_timeout))
+        lang = _lang(ctx)
+        message = _approval_message(job, approval, lang)
+        asking = asyncio.ensure_future(
+            asyncio.wait_for(ctx.elicit(message, _answer_model(lang)), settings.approval_timeout))
         try:
             while True:
                 done, _ = await asyncio.wait({asking}, timeout=float(settings.mcp_progress_interval))
@@ -320,13 +375,13 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
                     asking.cancel()
                     return True
                 if reporter is not None:
-                    await reporter.send(job, "waiting for the user's answer to the approval question")
+                    await reporter.send(job, i18n.t(reporter.lang, "progress.waiting_answer"))
             answer = asking.result()
         except NoBackChannelError:
             return mtypes.InputRequiredResult(
                 input_requests={
                     f"approve-{approval['id']}": mtypes.ElicitRequest(
-                        params=mtypes.ElicitRequestFormParams(message=message, requested_schema=_SCHEMA)
+                        params=mtypes.ElicitRequestFormParams(message=message, requested_schema=_schema(lang))
                     )
                 },
                 request_state=_STATE + json.dumps({"job": job.id, "approval": approval["id"]}),
@@ -403,26 +458,27 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
         interval = float(settings.mcp_progress_interval)
         loop = asyncio.get_running_loop()
         asked: set[str] = set()
-        await reporter.send(job, _step_text(job))
+        lang = reporter.lang
+        await reporter.send(job, _step_text(job, lang))
         sent_at = loop.time()
         while not job.done and not manager.closing:
             approval = job.pending_approval if job.status == st.INPUT_REQUIRED else None
             if approval is not None and approval.get("id") not in asked:
                 asked.add(approval.get("id"))
                 if _can_elicit(ctx):
-                    await reporter.send(job, "asking the user (elicitation): " + _step_text(job).removeprefix(
-                        "input_required: "))
+                    what = _step_text(job, lang).removeprefix("input_required: ")
+                    await reporter.send(job, i18n.t(lang, "progress.asking", what=what))
                     answer = await _ask_human(job, ctx, reporter)
                     if isinstance(answer, mtypes.InputRequiredResult):
                         return answer
                     sent_at = loop.time()
                     if answer:
                         continue
-                await reporter.send(job, _step_text(job))
+                await reporter.send(job, _step_text(job, lang))
                 sent_at = loop.time()
             job.changed.clear()
             # Anything new since the last notification (it may have come while that one was sent)?
-            if _step_text(job) == reporter.sent_text and not job.done and job.pending_approval is approval:
+            if _step_text(job, lang) == reporter.sent_text and not job.done and job.pending_approval is approval:
                 left = max(0.1, interval - (loop.time() - sent_at))
                 try:
                     await asyncio.wait_for(job.changed.wait(), left)
@@ -430,12 +486,12 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
                     pass
             if job.done:
                 break
-            text = _step_text(job)
+            text = _step_text(job, lang)
             if text != reporter.sent_text or loop.time() - sent_at >= interval:
                 await reporter.send(job, text)
                 sent_at = loop.time()
         if job.done:
-            await reporter.send(job, job.status, final=True)
+            await reporter.send(job, _final_text(job, lang), final=True)
         return None
 
     def payload(job: Job, recent: int = 0) -> dict[str, Any]:
@@ -459,16 +515,15 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
             if not settings.mcp_cancel_on_cancelled:
                 logger.info("job %s: agent_run call cancelled, job keeps running (MCP_CANCEL_ON_CANCELLED=false)", job.id)
                 return
-            reason = "Cancelled by the MCP client (notifications/cancelled for the agent_run call)."
+            reason = i18n.msg("reason.mcp_cancelled")
         else:
             if not settings.mcp_cancel_on_disconnect:
                 logger.info("job %s: agent_run call ended (%s), job keeps running (MCP_CANCEL_ON_DISCONNECT=false)",
                             job.id, kind)
                 return
             # On 2026-07-28 HTTP a client cancel is a closed request stream, so it lands here too.
-            reason = ("Cancelled: the MCP client closed the agent_run call while it was open "
-                      "(disconnected, or cancelled it on a transport without notifications/cancelled).")
-        logger.info("job %s: %s", job.id, reason)
+            reason = i18n.msg("reason.mcp_disconnect")
+        logger.info("job %s: %s", job.id, i18n.english(reason))
         manager.cancel(job.id, reason)
 
     def _conversation(ctx: Context | None, explicit: str) -> str:
@@ -599,7 +654,8 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
             await manager.wait(job, min(15, settings.mcp_max_wait))
             return payload(job)
         if conversation_id.strip():
-            jobs = manager.cancel_conversation(conversation_id, "Cancelled (agent_cancel conversation_id).")
+            jobs = manager.cancel_conversation(
+                conversation_id, i18n.msg("reason.cancelled_via", via="agent_cancel conversation_id"))
             await asyncio.gather(*(manager.wait(job, min(15, settings.mcp_max_wait)) for job in jobs))
             return {"conversation_id": conversation_id.strip(), "cancelled": [payload(job) for job in jobs]}
         jobs = manager.cancel_workspace(workspace)

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import pytest
 
 from agent_worker import fallback as fb
+from agent_worker import i18n
 from agent_worker.engine import EngineError, Outcome
 from agent_worker.engines import EngineRouter
 from agent_worker.jobs import JobManager, JobRequest, Store
@@ -102,7 +103,10 @@ def test_reset_times() -> None:
 def test_status_line_text() -> None:
     at = time.time() + 3600
     text = fb.describe("claude", fb.Failure(fb.LIMIT, "limit", at))
-    assert text == f"claude am Limit (Reset {fb.clock(at)})"
+    assert text == f"claude at its usage limit (reset {fb.clock(at)})"
+    # People see it in their language (0.7.1): the German text is the one of 0.6.0.
+    message = fb.describe_msg("claude", fb.Failure(fb.LIMIT, "limit", at))
+    assert i18n.render("de", message) == f"claude am Limit (Reset {fb.clock(at)})"
 
 
 # ---- configuration ------------------------------------------------------------------------------
@@ -248,8 +252,11 @@ async def test_limit_hands_over_to_next_engine(settings) -> None:
     assert job.engines_used() == ["claude", "cursor"]
     assert [a["status"] for a in job.attempts] == ["handed_off", "completed"]
     steps = [e.get("text") for e in job.events if e["type"] == "status"]
-    switch = next(t for t in steps if "übernimmt" in t)
-    assert switch.startswith("claude am Limit (Reset ") and switch.endswith("– cursor übernimmt")
+    switch = next(t for t in steps if "takes over" in t)
+    assert switch.startswith("claude at its usage limit (reset ") and switch.endswith("– cursor takes over")
+    event = next(e for e in job.events if e.get("text") == switch)
+    german = i18n.event_text(event, "de")
+    assert german.startswith("claude am Limit (Reset ") and german.endswith("– cursor übernimmt")
     assert "Engines: claude → cursor" in steps
     # The handoff: original task, journal of what ran, the rule not to repeat side effects.
     task = engines["cursor"].specs[0].task
@@ -289,7 +296,7 @@ async def test_not_signed_in_engines_are_skipped(settings) -> None:
     assert job.engines_used() == ["claude", "codex"]
     assert any(a["engine"] == "cursor" and a["status"] == "skipped" for a in job.attempts)
     assert not engines["cursor"].specs
-    assert any("codex übernimmt" in (e.get("text") or "") for e in job.events)
+    assert any("codex takes over" in (e.get("text") or "") for e in job.events)
 
 
 async def test_non_provider_failures_end_the_job(settings) -> None:
@@ -346,7 +353,10 @@ async def test_waits_when_no_engine_is_left_and_resumes(settings) -> None:
             break
     assert job.status == "queued" and job.waiting_for == "engine"
     message = job.status_message()
-    assert message.startswith("queued: Keine Engine frei (claude am Limit (Reset ") and "automatisch weiter" in message
+    assert message.startswith("queued: No engine available (claude at its usage limit (reset ")
+    assert "goes on automatically" in message
+    german = job.status_message(lang="de")
+    assert german.startswith("queued: Keine Engine frei (claude am Limit (Reset ") and "automatisch weiter" in german
     # The waiting job gives its slot back: another job runs meanwhile.
     other = manager.submit(JobRequest(task="chat", tools="none", engine="codex"))
     await manager.wait(other, 3)
@@ -355,7 +365,8 @@ async def test_waits_when_no_engine_is_left_and_resumes(settings) -> None:
     assert job.status == "completed", job.error
     assert job.engines_used() == ["claude", "cursor", "claude"]
     assert job.result == "claude done"
-    assert any("Job geht weiter" in (e.get("text") or "") for e in job.events)
+    assert any("the job goes on" in (e.get("text") or "") for e in job.events)
+    assert any("Job geht weiter" in i18n.event_text(e, "de") for e in job.events)
 
 
 async def test_cancel_while_waiting(settings) -> None:
@@ -375,7 +386,7 @@ async def test_waits_for_a_sign_in(settings) -> None:
     manager, engines = _setup(settings, chain="claude,cursor", available={"claude": False, "cursor": False})
     job = manager.submit(JobRequest(task="t"))
     await asyncio.sleep(0.1)
-    assert job.status == "queued" and "angemeldet" in job.status_message()
+    assert job.status == "queued" and "signed in" in job.status_message() and "angemeldet" in job.status_message(lang="de")
     engines["cursor"].available = True
     await manager.wait(job, 3)
     assert job.status == "completed" and job.engines_used() == ["cursor"]
@@ -404,7 +415,7 @@ async def test_promotion_at_turn_start_after_backoff(settings) -> None:
     clock.now += 301
     third = await _turn(manager, "three")
     assert third.engines_used() == ["claude"]
-    assert any("claude wieder verfügbar – zurück von cursor zu claude" in (e.get("text") or "") for e in third.events)
+    assert any("claude available again – back from cursor to claude" in (e.get("text") or "") for e in third.events)
     # Claude missed turns: its own session is dropped and it gets the conversation.
     spec = engines["claude"].specs[-1]
     assert ("default", "s1") in engines["claude"].forgotten
@@ -462,12 +473,14 @@ def test_v1_stream_shows_the_switch_as_thinking(settings) -> None:
     app_settings = manager.settings
     with TestClient(create_app(app_settings, router), base_url="http://127.0.0.1:8787") as client:
         payload = {"model": "claude-code", "stream": True, "messages": [{"role": "user", "content": "hello"}]}
-        with client.stream("POST", "/v1/chat/completions", json=payload) as resp:
+        # Accept-Language: the thinking lines are in German (0.7.1), the engine names and commands stay.
+        with client.stream("POST", "/v1/chat/completions", json=payload,
+                           headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.5"}) as resp:
             lines = [line for line in resp.iter_lines() if line.startswith("data: ")]
         chunks = [json.loads(line[6:]) for line in lines[:-1]]
         thinking = "".join(c["choices"][0]["delta"].get("reasoning_content", "") for c in chunks if c.get("choices"))
         content = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks if c.get("choices"))
-        assert "– cursor übernimmt" in thinking and "Engines: claude → cursor" in thinking
+        assert "– cursor übernimmt" in thinking and "Läuft" in thinking and "Engines: claude → cursor" in thinking
         assert content.endswith("cursor done")
         health = client.get("/health").json()
         assert health["fallback"]["engines"] == ["claude", "cursor", "codex"]
