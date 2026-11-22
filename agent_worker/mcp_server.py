@@ -23,7 +23,9 @@ logger = logging.getLogger(__name__)
 INSTRUCTIONS = (
     "Agent Worker runs coding tasks on a coding agent (Cursor or Claude Code) in a workspace folder on the "
     "worker's machine. Use agent_run for work that needs files, a shell, a repository or several steps. "
-    "Long tasks return a job_id while still running: poll it with agent_job, stop it with agent_cancel. "
+    "Send _meta.progressToken with agent_run and the call stays open until the job ends, with "
+    "notifications/progress on every step and as keepalive (reset your timeout on progress). Without it, "
+    "long tasks return a job_id while still running: poll it with agent_job, stop it with agent_cancel. "
     "agent_jobs lists what runs or waits (also jobs whose job_id you never got). "
     "Statuses follow MCP Tasks: queued, working, input_required, completed, failed, cancelled. "
     "Status input_required means a remote command waits for the user: show it to them and let them decide. "
@@ -83,6 +85,76 @@ def _can_elicit(ctx: Context | None) -> bool:
     except Exception:
         return False
     return caps is not None and getattr(caps, "elicitation", None) is not None
+
+
+def _token_ok(token: Any) -> bool:
+    return isinstance(token, (str, int)) and not isinstance(token, bool)
+
+
+def _progress_token(ctx: Context | None) -> Any:
+    """The request's _meta.progressToken (None: the client did not ask for progress).
+
+    mcp 2.3.0 keeps the token on the request's dispatch context (JSON-RPC transports: `_progress_token`;
+    the in-process client: a progress callback) and drops it from ctx.request_context.meta on 2026-07-28,
+    so this looks there first and at the request's _meta second.
+    """
+    try:
+        rc = ctx.request_context  # type: ignore[union-attr]
+    except Exception:
+        return None
+    try:
+        dctx = rc.session._request_outbound
+    except Exception:
+        dctx = None
+    for _ in range(4):
+        if dctx is None:
+            break
+        token = getattr(dctx, "_progress_token", None)
+        if _token_ok(token):
+            return token
+        if getattr(dctx, "_on_progress", None) is not None:
+            return rc.request_id if _token_ok(rc.request_id) else "in-process"
+        dctx = getattr(dctx, "_inner", None)
+    for source in (getattr(rc, "meta", None), (getattr(rc, "params", None) or {}).get("_meta")
+                   if isinstance(getattr(rc, "params", None), dict) else None):
+        if isinstance(source, dict):
+            for key in ("progress_token", "progressToken"):
+                if _token_ok(source.get(key)):
+                    return source[key]
+    return None
+
+
+class _Reporter:
+    """notifications/progress for one call. progress must grow with every notification (spec), so it is
+    the job's event count, but at least one more than the last value sent."""
+
+    def __init__(self, ctx: Context | None) -> None:
+        self.ctx = ctx
+        self.last = 0.0
+        self.sent_text = ""
+
+    async def send(self, job: Job, message: str, *, final: bool = False) -> None:
+        if self.ctx is None:
+            return
+        value = float(max(len(job.events), self.last + 1))
+        try:
+            await self.ctx.report_progress(value, value if final else None, f"job {job.id}: {message}"[:300])
+        except Exception:
+            logger.debug("progress report failed", exc_info=True)
+            return
+        self.last = value
+        self.sent_text = message
+
+
+def _step_text(job: Job) -> str:
+    """A short line for a progress message: the last step while working, else what the status means."""
+    if job.status == st.WORKING:
+        step = next(
+            (str(e.get("text") or "") for e in reversed(job.events) if e.get("type") in {"tool", "status"}),
+            "",
+        )
+        return step or "working"
+    return job.status_message()
 
 
 def _depth(ctx: Context | None) -> int:
@@ -211,18 +283,9 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
             "no engine left it waits (queued) and resumes on its own."
         )
 
-    async def _progress(ctx: Context | None, job: Job) -> None:
-        if ctx is None:
-            return
-        try:
-            last = next(
-                (str(e.get("text") or "") for e in reversed(job.events) if e.get("type") in {"tool", "status"}),
-                "",
-            )
-            # The job_id goes with every progress message: a client that gives up waiting has seen it.
-            await ctx.report_progress(len(job.events), None, f"job {job.id}: {last or job.status}")
-        except Exception:
-            logger.debug("progress report failed", exc_info=True)
+    async def _progress(ctx: Context | None, job: Job, reporter: _Reporter | None = None) -> None:
+        # The job_id goes with every progress message: a client that gives up waiting has seen it.
+        await (reporter or _Reporter(ctx)).send(job, _step_text(job))
 
     def _apply(job: Job, decided: tuple[bool, str]) -> bool:
         try:
@@ -231,18 +294,34 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
             return False
         return True
 
-    async def _ask_human(job: Job, ctx: Context | None) -> bool | mtypes.InputRequiredResult:
+    async def _ask_human(
+        job: Job, ctx: Context | None, reporter: _Reporter | None = None
+    ) -> bool | mtypes.InputRequiredResult:
         """Ask the user through the MCP client (elicitation), never the calling model.
 
         True once decided. Older protocol versions get a server-initiated request on the open
         stream; 2026-07-28 clients get an InputRequiredResult and retry the call with the answer.
+        With a reporter (agent_run with a progressToken) the call sends keepalive progress while the
+        question is open, and stops asking when the approval is answered another way (HTTP, agent_approve).
         """
         approval = job.pending_approval
         if approval is None or not _can_elicit(ctx):
             return False
         message = _approval_message(job, approval)
+        asking = asyncio.ensure_future(asyncio.wait_for(ctx.elicit(message, ApprovalAnswer), settings.approval_timeout))
         try:
-            answer = await asyncio.wait_for(ctx.elicit(message, ApprovalAnswer), settings.approval_timeout)
+            while True:
+                done, _ = await asyncio.wait({asking}, timeout=float(settings.mcp_progress_interval))
+                if done:
+                    break
+                pending = job.pending_approval or {}
+                if job.done or pending.get("id") != approval["id"]:
+                    # Answered elsewhere (or the job ended): the question is moot.
+                    asking.cancel()
+                    return True
+                if reporter is not None:
+                    await reporter.send(job, "waiting for the user's answer to the approval question")
+            answer = asking.result()
         except NoBackChannelError:
             return mtypes.InputRequiredResult(
                 input_requests={
@@ -252,6 +331,9 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
                 },
                 request_state=_STATE + json.dumps({"job": job.id, "approval": approval["id"]}),
             )
+        except asyncio.CancelledError:
+            asking.cancel()
+            raise
         except Exception:
             logger.info("elicitation failed for job %s", job.id, exc_info=True)
             return False
@@ -284,10 +366,13 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
                 await asyncio.sleep(0)
         return job
 
-    async def _wait(job: Job, seconds: float, ctx: Context | None) -> mtypes.InputRequiredResult | None:
+    async def _wait(
+        job: Job, seconds: float, ctx: Context | None, reporter: _Reporter | None = None
+    ) -> mtypes.InputRequiredResult | None:
         """Wait in slices so the client sees progress; stop to ask when the job needs approval."""
         cap = float(settings.mcp_max_wait)
         left = max(0.0, min(float(seconds), cap))
+        reporter = reporter or _Reporter(ctx)
         while not job.done:
             if job.status == st.INPUT_REQUIRED:
                 asked = await _ask_human(job, ctx)
@@ -302,7 +387,55 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
             step = min(5.0, left)
             await manager.wait(job, step, stop_on_approval=True)
             left -= step
-            await _progress(ctx, job)
+            await _progress(ctx, job, reporter)
+        return None
+
+    async def _follow(job: Job, ctx: Context | None) -> mtypes.InputRequiredResult | None:
+        """agent_run with a progressToken: stay with the job until it ends (MCP progress, no wait cap).
+
+        A notification goes out whenever the status or the last step changes and at least every
+        MCP_PROGRESS_INTERVAL_SECONDS as keepalive. The job's own watchdogs (JOB_MAX_RUNTIME_SECONDS,
+        JOB_IDLE_TIMEOUT_SECONDS, APPROVAL_TIMEOUT_SECONDS) still end it. An approval is asked once by
+        elicitation when the client can; otherwise (or when the user dismissed it) the progress message
+        says what the job waits for and the other approval paths stay open.
+        """
+        reporter = _Reporter(ctx)
+        interval = float(settings.mcp_progress_interval)
+        loop = asyncio.get_running_loop()
+        asked: set[str] = set()
+        await reporter.send(job, _step_text(job))
+        sent_at = loop.time()
+        while not job.done and not manager.closing:
+            approval = job.pending_approval if job.status == st.INPUT_REQUIRED else None
+            if approval is not None and approval.get("id") not in asked:
+                asked.add(approval.get("id"))
+                if _can_elicit(ctx):
+                    await reporter.send(job, "asking the user (elicitation): " + _step_text(job).removeprefix(
+                        "input_required: "))
+                    answer = await _ask_human(job, ctx, reporter)
+                    if isinstance(answer, mtypes.InputRequiredResult):
+                        return answer
+                    sent_at = loop.time()
+                    if answer:
+                        continue
+                await reporter.send(job, _step_text(job))
+                sent_at = loop.time()
+            job.changed.clear()
+            # Anything new since the last notification (it may have come while that one was sent)?
+            if _step_text(job) == reporter.sent_text and not job.done and job.pending_approval is approval:
+                left = max(0.1, interval - (loop.time() - sent_at))
+                try:
+                    await asyncio.wait_for(job.changed.wait(), left)
+                except asyncio.TimeoutError:
+                    pass
+            if job.done:
+                break
+            text = _step_text(job)
+            if text != reporter.sent_text or loop.time() - sent_at >= interval:
+                await reporter.send(job, text)
+                sent_at = loop.time()
+        if job.done:
+            await reporter.send(job, job.status, final=True)
         return None
 
     def payload(job: Job, recent: int = 0) -> dict[str, Any]:
@@ -352,7 +485,11 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
             "Give a task to a coding agent. It can read and edit files in the workspace, run a shell, "
             "use git, ssh to servers, and call MCP servers. Returns the agent's final answer plus changed files "
             "and commits. If the task takes longer than wait_seconds (at most "
-            f"{settings.mcp_max_wait}), returns status 'working' (or 'queued') and a job_id for agent_job. "
+            f"{settings.mcp_max_wait}), returns status 'working' (or 'queued') and a job_id for agent_job"
+            + ("; with _meta.progressToken the call instead stays open until the job ends and sends "
+               "notifications/progress (approvals are asked by elicitation when the client supports it). "
+               if settings.mcp_wait_with_progress else ". ")
+            + 
             "Cancelling this call while it is open cancels the job; background=true keeps the job running "
             "after a cancelled call or a disconnect (stop it with agent_cancel). conversation_id (or _meta "
             "'io.github.domdus/conversation_id' / 'contextId') links the job to the client's conversation: an "
@@ -376,6 +513,8 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         job: Job | None = None
+        reporter = _Reporter(ctx)
+        follow = settings.mcp_wait_with_progress and _progress_token(ctx) is not None
         try:
             job = await _resume(ctx)
             if job is None:
@@ -399,9 +538,13 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
                     return {"status": "rejected", "error": str(exc)}
                 # Known before any waiting: in the log, and in the first progress message to the client.
                 logger.info("agent_run job_id=%s", job.id)
-                await _progress(ctx, job)
-            wait = settings.mcp_wait_seconds if wait_seconds is None else wait_seconds
-            asked = await _wait(job, wait, ctx)
+                if not follow:
+                    await _progress(ctx, job, reporter)
+            if follow:
+                asked = await _follow(job, ctx)
+            else:
+                wait = settings.mcp_wait_seconds if wait_seconds is None else wait_seconds
+                asked = await _wait(job, wait, ctx, reporter)
             return asked if asked is not None else payload(job, recent=5)
         except asyncio.CancelledError:
             # MCP cancellation: the SDK cancels this handler on notifications/cancelled for the call, and on

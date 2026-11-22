@@ -336,7 +336,8 @@ async def test_waits_when_no_engine_is_left_and_resumes(settings) -> None:
     manager, engines = _setup(
         replace(settings, max_concurrent_jobs=1),
         chain="claude,cursor",
-        scripts={"claude": [_soon(1)], "cursor": [Outcome(status="failed", error="429 too many requests, retry after 3600")]},
+        # 2 s, not 1: the reset is whole seconds, so 1 s could already be past when the message is read.
+        scripts={"claude": [_soon(2)], "cursor": [Outcome(status="failed", error="429 too many requests, retry after 3600")]},
     )
     job = manager.submit(JobRequest(task="long task"))
     for _ in range(100):

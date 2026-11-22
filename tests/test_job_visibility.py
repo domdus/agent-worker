@@ -270,7 +270,8 @@ def _data(result):
 
 async def test_agent_run_wait_is_capped_and_returns_the_job_id(settings, engine):
     engine.gate = asyncio.Event()
-    manager = _manager(settings, engine, mcp_max_wait=1)
+    # Progress messages without waiting for the end (MCP_WAIT_WITH_PROGRESS=false; see test_mcp_progress).
+    manager = _manager(settings, engine, mcp_max_wait=1, mcp_wait_with_progress=False)
     progress: list[str] = []
 
     async def on_progress(_progress, _total, message):

@@ -90,6 +90,11 @@ class Settings:
     # by disconnecting cancels the job it started, unless the job was started with background=true.
     mcp_cancel_on_cancelled: bool = True
     mcp_cancel_on_disconnect: bool = True
+    # agent_run with _meta.progressToken: keep the call open until the job ends and send
+    # notifications/progress (every step, and at least every mcp_progress_interval seconds as keepalive)
+    # instead of returning after MCP_WAIT_SECONDS. false: the old behaviour for every client.
+    mcp_wait_with_progress: bool = True
+    mcp_progress_interval: int = 10
     # What `status` reports: "mcp" (MCP Task vocabulary: queued, working, input_required, completed, failed,
     # cancelled) or "legacy" (names before 0.5.0: queued, running, needs_approval, succeeded, failed,
     # cancelled). legacy_status always carries the old name, filters accept both.
@@ -204,6 +209,8 @@ class Settings:
             mcp_max_wait=_int("MCP_MAX_WAIT_SECONDS", 25, 1),
             mcp_cancel_on_cancelled=_bool("MCP_CANCEL_ON_CANCELLED", True),
             mcp_cancel_on_disconnect=_bool("MCP_CANCEL_ON_DISCONNECT", True),
+            mcp_wait_with_progress=_bool("MCP_WAIT_WITH_PROGRESS", True),
+            mcp_progress_interval=_int("MCP_PROGRESS_INTERVAL_SECONDS", 10, 1),
             job_status_names=_status_names(os.environ.get("JOB_STATUS_NAMES", "")),
             task_poll_interval_ms=_int("TASK_POLL_INTERVAL_MS", 5000, 500),
             max_call_depth=_int("MAX_CALL_DEPTH", 1, 1),
