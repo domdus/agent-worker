@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.7.2 (2026-11-22)
+
+MCP tool annotations, `isError`, a real `outputSchema`, and a 2026-07-28 HTTP path that survives proxies.
+
+### Added
+
+- Tool annotations (MCP 2025-11-25) and a `title` on every tool: `readOnlyHint` for `agent_jobs`, `agent_job`, `agent_workspaces`, `auth_status`; `destructiveHint` for `agent_run`, `agent_cancel`, `agent_approve`; `idempotentHint` and `openWorldHint` on all (`agent_run`/`agent_approve` open-world, `agent_cancel` idempotent).
+- `agent_run`, `agent_job`, `agent_approve`: a real `outputSchema` (`JobResult`: `status` required, `job_id`, `status_message`, `task`, `approval`, `result`, `error`, `changes`, `usage`, `engines_used`, `fallback`, live fields; extra fields allowed) instead of the generic object schema; `structuredContent` is validated against it.
+- `MCP_PROTOCOL_MODERN` (`auto` | `off`, default `auto`): `off` answers every 2026-07-28 request with `-32022` naming only the handshake versions, so clients fall back to `initialize` + `Mcp-Session-Id`.
+- The server announces `title` "Agent Worker" and its version in `serverInfo`.
+
+### Changed
+
+- `isError: true` for a job that `failed` or was `cancelled`, a refused call (`status: "rejected"`, e.g. a bad workspace) and an unknown `job_id`; `structuredContent` stays. An `agent_cancel` that cancelled something is not an error.
+
+### Fixed
+
+- 2026-07-28 over HTTP behind a proxy (e.g. Claude Code / Claude Agent SDK through the AI Workspace runtime MCP proxy, `SdkHttpError … CLIENT_HTTP_NOT_IMPLEMENTED`): the MCP SDK routes by the `MCP-Protocol-Version` header alone, so a request whose header a proxy dropped landed on the session transport and got `400 Bad Request: Missing session ID`; a dropped `Mcp-Method`/`Mcp-Name` gave `400` (`-32020`); an `initialize` with a stale 2026-07-28 header gave `400` (`-32602`). Missing headers are now filled in from the body's envelope and such an `initialize` is served on the handshake path. Contradicting headers are still refused.
+- 2026-07-28 approvals (`InputRequiredResult`): the sealed `requestState` expired after the SDK's 600 s while `APPROVAL_TIMEOUT_SECONDS` is 1800, so a late answer got `400 Invalid or expired requestState`. It now lives `APPROVAL_TIMEOUT_SECONDS` + 300 s (still per process: after a restart the question is asked again).
+
+### Upgrade notes
+
+- Image: `ghcr.io/domdus/agent-worker:0.7.2` (or `:latest`): `docker compose pull && docker compose up -d --no-build` with the existing `.env`. Recreating the container stops running jobs; do it when none are open.
+- Clients that check `outputSchema` now see the job fields; clients that treated `structuredContent.status == "failed"` as success-with-error now also get `isError: true`.
+
 ## 0.7.1 (2026-11-22)
 
 User-facing texts in the user's language (`Accept-Language`).

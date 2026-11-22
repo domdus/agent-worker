@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Callable
+from typing import Annotated, Any, Callable, Literal
 
 from mcp import types as mtypes
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.shared.exceptions import NoBackChannelError
-from pydantic import BaseModel, Field, create_model
+from mcp.server.request_state import RequestStateSecurity
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from agent_worker import i18n
 from agent_worker import tasks as st
@@ -35,6 +36,89 @@ INSTRUCTIONS = (
     "auth_status tells which engines are signed in; signing in is up to the user (UI or HTTP API)."
 )
 
+
+
+# ---- Output schema of agent_run / agent_job / agent_approve (outputSchema, structuredContent) ------------
+
+JobStatus = Literal[
+    # MCP Task vocabulary (JOB_STATUS_NAMES=mcp, the default)
+    "queued", "working", "input_required", "completed", "failed", "cancelled",
+    # names before 0.5.0 (JOB_STATUS_NAMES=legacy)
+    "running", "needs_approval", "succeeded",
+    # no job: the request was refused, or the job_id is not known
+    "rejected", "unknown",
+]
+ERROR_STATUSES = frozenset({"failed", "cancelled", "rejected", "unknown"})
+
+
+class _Open(BaseModel):
+    # Later versions may add fields; clients should keep what they do not know.
+    model_config = ConfigDict(extra="allow")
+
+
+class TaskView(_Open):
+    """The job as an MCP Task object (tasks/get shape)."""
+
+    taskId: str
+    status: Literal["working", "input_required", "completed", "failed", "cancelled"]
+    statusMessage: str | None = None
+    createdAt: str | None = None
+    lastUpdatedAt: str | None = None
+    ttl: int | None = None
+    pollInterval: int | None = Field(default=None, description="Suggested polling interval (ms) while running.")
+
+
+class PendingApproval(_Open):
+    """A remote command that waits for the user's decision."""
+
+    id: str
+    tool: str | None = Field(default=None, description="ssh, scp, sftp or rsync")
+    host: str | None = None
+    user: str | None = None
+    hostname: str | None = Field(default=None, description="The real host behind an ssh alias.")
+    command: str | None = None
+
+
+class JobResult(_Open):
+    """An agent job: status, and once it ended the agent's answer (result) or what went wrong (error)."""
+
+    status: JobStatus = Field(description="queued/working/input_required while it runs; completed, failed or "
+                              "cancelled at the end; rejected/unknown when there is no job (see error).")
+    job_id: str | None = Field(default=None, description="Poll it with agent_job, stop it with agent_cancel.")
+    legacy_status: str | None = Field(default=None, description="The status name before 0.5.0.")
+    status_message: str | None = None
+    engine: str | None = None
+    workspace: str | None = None
+    model: str | None = None
+    session: str | None = None
+    conversation_id: str | None = None
+    background: bool | None = None
+    task: TaskView | None = None
+    approval: PendingApproval | None = Field(default=None, description="Set while status is input_required.")
+    hint: str | None = Field(default=None, description="What to do next.")
+    result: str | None = Field(default=None, description="The agent's final answer.")
+    error: str | None = None
+    changes: dict[str, Any] | None = Field(default=None, description="Changed files and commits in the workspace.")
+    usage: dict[str, Any] | None = None
+    engines_used: list[str] | None = None
+    fallback: list[dict[str, Any]] | None = Field(default=None, description="Every engine try, with why it ended.")
+    runtime_seconds: int | None = None
+    last_step: str | None = None
+    last_event_at: str | None = None
+    recent_steps: list[str] | None = None
+
+
+def tool_result(data: dict[str, Any]) -> mtypes.CallToolResult:
+    """A tool answer: structuredContent plus the same JSON as text; isError for a failed, cancelled, refused
+    or unknown job (MCP: errors of the tool's work go in the result, not as a protocol error)."""
+    return mtypes.CallToolResult(
+        content=[mtypes.TextContent(type="text", text=json.dumps(data, indent=2, ensure_ascii=False))],
+        structured_content=data,
+        is_error=str(data.get("status") or "") in ERROR_STATUSES,
+    )
+
+
+JobAnswer = Annotated[mtypes.CallToolResult, JobResult]
 
 
 class ApprovalAnswer(BaseModel):
@@ -325,7 +409,18 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
         def auth_status() -> dict[str, Any]:
             return overview(settings, manager.engine, reveal=False)
 
-    server = MCPServer(name="agent-worker", instructions=INSTRUCTIONS)
+    from agent_worker.version import VERSION
+
+    server = MCPServer(
+        name="agent-worker",
+        title="Agent Worker",
+        version=VERSION,
+        instructions=INSTRUCTIONS,
+        # The sealed requestState of a 2026-07-28 approval question (InputRequiredResult) must outlive the
+        # question: the SDK's default of 600 s is shorter than APPROVAL_TIMEOUT_SECONDS, and a user who
+        # answered later got a 400 "Invalid or expired requestState".
+        request_state_security=RequestStateSecurity.ephemeral(ttl=float(settings.approval_timeout + 300)),
+    )
     engines_note = _engines_note(manager.engine)
     if manager.fallback_on:
         chain = " -> ".join(name for name, _ in settings.fallback_engines)
@@ -536,6 +631,10 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
         return conversation_from_meta(meta)
 
     @server.tool(
+        title="Run a coding agent task",
+        annotations=mtypes.ToolAnnotations(
+            title="Run a coding agent task", read_only_hint=False, destructive_hint=True,
+            idempotent_hint=False, open_world_hint=True),
         description=(
             "Give a task to a coding agent. It can read and edit files in the workspace, run a shell, "
             "use git, ssh to servers, and call MCP servers. Returns the agent's final answer plus changed files "
@@ -566,7 +665,7 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
         background: bool = False,
         conversation_id: str = "",
         ctx: Context | None = None,
-    ) -> dict[str, Any]:
+    ) -> JobAnswer | mtypes.InputRequiredResult:
         job: Job | None = None
         reporter = _Reporter(ctx)
         follow = settings.mcp_wait_with_progress and _progress_token(ctx) is not None
@@ -590,7 +689,7 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
                         )
                     )
                 except JobError as exc:
-                    return {"status": "rejected", "error": str(exc)}
+                    return tool_result({"status": "rejected", "error": str(exc)})
                 # Known before any waiting: in the log, and in the first progress message to the client.
                 logger.info("agent_run job_id=%s", job.id)
                 if not follow:
@@ -600,7 +699,7 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
             else:
                 wait = settings.mcp_wait_seconds if wait_seconds is None else wait_seconds
                 asked = await _wait(job, wait, ctx, reporter)
-            return asked if asked is not None else payload(job, recent=5)
+            return asked if asked is not None else tool_result(payload(job, recent=5))
         except asyncio.CancelledError:
             # MCP cancellation: the SDK cancels this handler on notifications/cancelled for the call, and on
             # transports that notice it (2026-07-28 HTTP), when the client drops the connection.
@@ -608,20 +707,27 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
             raise
 
     @server.tool(
+        title="Agent job status and result",
+        annotations=mtypes.ToolAnnotations(
+            title="Agent job status and result", read_only_hint=True, idempotent_hint=True, open_world_hint=False),
         description=(
             "Status and result of an agent job. wait_seconds waits for the job to finish "
             f"(at most {settings.mcp_max_wait}) before answering; call again while it runs."
         )
     )
-    async def agent_job(job_id: str, wait_seconds: int = 0, ctx: Context | None = None) -> dict[str, Any]:
+    async def agent_job(
+        job_id: str, wait_seconds: int = 0, ctx: Context | None = None
+    ) -> JobAnswer | mtypes.InputRequiredResult:
         job = await _resume(ctx) or manager.get(job_id)
         if job is None:
-            return {"status": "unknown", "error": f"No job {job_id!r}."}
+            return tool_result({"status": "unknown", "error": f"No job {job_id!r}."})
         asked = await _wait(job, wait_seconds, ctx)
-        return asked if asked is not None else payload(job, recent=5)
+        return asked if asked is not None else tool_result(payload(job, recent=5))
 
     @server.tool(
-        annotations=mtypes.ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+        title="List agent jobs",
+        annotations=mtypes.ToolAnnotations(
+            title="List agent jobs", read_only_hint=True, idempotent_hint=True, open_world_hint=False),
         description=(
             "List agent jobs: by default every queued, working or input_required job plus the last 20 that "
             "ended. Each row: job_id, workspace, engine, model, status and status_message, conversation_id, "
@@ -638,36 +744,49 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
         return {"jobs": [manager.describe(job) for job in rows]}
 
     @server.tool(
+        title="Cancel agent jobs",
+        annotations=mtypes.ToolAnnotations(
+            title="Cancel agent jobs", read_only_hint=False, destructive_hint=True, idempotent_hint=True,
+            open_world_hint=False),
         description=(
             "Stop agent jobs: one by job_id, every queued and working job in a workspace (workspace=...), or "
             "every one of a client conversation (conversation_id=...). The engine and everything it started are "
             "stopped and the workspace is free for the next job."
         )
     )
-    async def agent_cancel(job_id: str = "", workspace: str = "", conversation_id: str = "") -> dict[str, Any]:
+    async def agent_cancel(
+        job_id: str = "", workspace: str = "", conversation_id: str = ""
+    ) -> Annotated[mtypes.CallToolResult, dict[str, Any]]:
+        # isError only when nothing could be cancelled; a job this call cancelled is the tool doing its job.
         if not job_id and not workspace and not conversation_id.strip():
-            return {"status": "rejected", "error": "Give a job_id, a workspace or a conversation_id."}
+            return tool_result({"status": "rejected", "error": "Give a job_id, a workspace or a conversation_id."})
         if job_id:
             job = manager.cancel(job_id)
             if job is None:
-                return {"status": "unknown", "error": f"No job {job_id!r}."}
+                return tool_result({"status": "unknown", "error": f"No job {job_id!r}."})
             await manager.wait(job, min(15, settings.mcp_max_wait))
-            return payload(job)
+            data = payload(job)
+            return mtypes.CallToolResult(
+                content=tool_result(data).content, structured_content=data, is_error=False)
         if conversation_id.strip():
             jobs = manager.cancel_conversation(
                 conversation_id, i18n.msg("reason.cancelled_via", via="agent_cancel conversation_id"))
             await asyncio.gather(*(manager.wait(job, min(15, settings.mcp_max_wait)) for job in jobs))
-            return {"conversation_id": conversation_id.strip(), "cancelled": [payload(job) for job in jobs]}
+            return tool_result({"conversation_id": conversation_id.strip(), "cancelled": [payload(job) for job in jobs]})
         jobs = manager.cancel_workspace(workspace)
         await asyncio.gather(*(manager.wait(job, min(15, settings.mcp_max_wait)) for job in jobs))
-        return {
+        return tool_result({
             "workspace": (workspace or "").strip().lower() or settings.default_workspace,
             "cancelled": [payload(job) for job in jobs],
-        }
+        })
 
     if settings.approval_tool:
 
         @server.tool(
+            title="Pass the user's approval answer",
+            annotations=mtypes.ToolAnnotations(
+                title="Pass the user's approval answer", read_only_hint=False, destructive_hint=True,
+                idempotent_hint=False, open_world_hint=True),
             description=(
                 "Pass the USER's answer to a job waiting for approval (status input_required). Only call this "
                 "after asking the user and getting their explicit answer; never decide on your own."
@@ -675,19 +794,21 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
         )
         async def agent_approve(
             job_id: str, approve: bool, note: str = "", wait_seconds: int | None = None, ctx: Context | None = None
-        ) -> dict[str, Any]:
+        ) -> JobAnswer | mtypes.InputRequiredResult:
             try:
                 job = manager.decide(job_id, approve, note)
             except JobError as exc:
-                return {"status": "rejected", "error": str(exc)}
+                return tool_result({"status": "rejected", "error": str(exc)})
             await asyncio.sleep(0)
             wait = settings.mcp_wait_seconds if wait_seconds is None else wait_seconds
             asked = await _wait(job, wait, ctx)
-            return asked if asked is not None else payload(job, recent=5)
+            return asked if asked is not None else tool_result(payload(job, recent=5))
 
     @server.tool(
         name="auth_status",
-        annotations=mtypes.ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+        title="Engine sign-in status",
+        annotations=mtypes.ToolAnnotations(
+            title="Engine sign-in status", read_only_hint=True, idempotent_hint=True, open_world_hint=False),
         description=(
             "Read-only: which engines are signed in and ready (credential source, plan when known, whether a "
             "sign-in is waiting). Signing in is done by the user in a UI or over the worker's HTTP API, not here."
@@ -696,7 +817,12 @@ def build_mcp(manager: JobManager, auth_status: Callable[[], dict[str, Any]] | N
     async def auth_status_tool() -> dict[str, Any]:
         return auth_status()
 
-    @server.tool(description="Workspaces the agents can use, and which one is the default.")
+    @server.tool(
+        title="List workspaces",
+        annotations=mtypes.ToolAnnotations(
+            title="List workspaces", read_only_hint=True, idempotent_hint=True, open_world_hint=False),
+        description="Workspaces the agents can use, and which one is the default.",
+    )
     async def agent_workspaces() -> dict[str, Any]:
         return {
             "workspaces": list_workspaces(settings),
